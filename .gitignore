@@ -1,0 +1,30 @@
+# Android and Gradle outputs
+.gradle/
+**/build/
+local.properties
+.idea/
+*.iml
+*.apk
+*.aab
+*.idsig
+*.log
+.DS_Store
+
+# Local credentials and signing material
+.env
+.env.*
+key.properties
+secrets.properties
+gradle-local.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+*.p8
+
+# Personal camera captures and local test output
+/samples/
+/captures/
+*.dng
