@@ -1,6 +1,7 @@
 package com.truehue.camera;
 
 import android.graphics.Bitmap;
+import android.graphics.ColorSpace;
 import android.graphics.Gainmap;
 import android.graphics.ImageFormat;
 import android.graphics.Rect;
@@ -30,11 +31,13 @@ final class RawRenderer {
 
     static final class Options {
         boolean natural = true;
+        boolean wideGamut = true;
         boolean ultraHdr = false;
         PhotoFilter filter = PhotoFilter.ORIGINAL;
         float manualKelvin = 0f;
         float manualTint = 0f;
         float userEvBias = 0f;
+        float fallbackMeteredBiasEv = Float.NaN;
     }
 
     static final class RawGeometry {
@@ -65,7 +68,8 @@ final class RawRenderer {
 
     static Bitmap render(Image raw, CameraCharacteristics sensor, TotalCaptureResult shot,
                          int clockwiseDegrees, Options options) {
-        return bitmap(pipeline(raw, sensor, shot, 0, options), clockwiseDegrees, options, sensor, shot, 1f);
+        float sceneEv = computeSceneEv(shot);
+        return bitmap(pipeline(raw, sensor, shot, 0, options, sceneEv), clockwiseDegrees, options, sensor, shot, 1f, sceneEv);
     }
 
     static Bitmap renderPreview(Image raw, CameraCharacteristics sensor, TotalCaptureResult shot,
@@ -79,18 +83,20 @@ final class RawRenderer {
     static Bitmap renderPreview(Image raw, CameraCharacteristics sensor, TotalCaptureResult shot,
                                 int clockwiseDegrees, int maxEdge, Options options) {
         if (maxEdge < 4) throw new IllegalArgumentException("RAW 预览尺寸太小");
-        return bitmap(pipeline(raw, sensor, shot, maxEdge, options), clockwiseDegrees, options, sensor, shot, 1f);
+        float sceneEv = computeSceneEv(shot);
+        return bitmap(pipeline(raw, sensor, shot, maxEdge, options, sceneEv), clockwiseDegrees, options, sensor, shot, 1f, sceneEv);
     }
 
     static Bitmap renderMerged(BurstRawMerger.Result merged, int[] channel, int width, int height,
                                CameraCharacteristics sensor, TotalCaptureResult shot,
                                int clockwiseDegrees, Options options) {
-        ColorCalibration cal = calibrateColor(sensor, shot, options);
+        float sceneEv = computeSceneEv(shot);
+        ColorCalibration cal = calibrateColor(sensor, shot, options, sceneEv);
         ShadingInfo shade = readShading(shot);
         BayerPipeline pipe = new BayerPipeline(merged.bayer12, width, 0, 0, width, height, channel,
                 merged.black12, merged.white12, cal.balance, cal.transform,
                 shade.map, shade.columns, shade.rows);
-        return bitmap(pipe, clockwiseDegrees, options, sensor, shot, merged.effectiveFrames);
+        return bitmap(pipe, clockwiseDegrees, options, sensor, shot, merged.effectiveFrames, sceneEv);
     }
 
     static RawGeometry inspectRaw(Image raw, CameraCharacteristics sensor, TotalCaptureResult shot) {
@@ -161,7 +167,7 @@ final class RawRenderer {
 
     private static Bitmap bitmap(BayerPipeline image, int degrees, Options options,
                                  CameraCharacteristics sensor, TotalCaptureResult shot,
-                                 float effectiveFrames) {
+                                 float effectiveFrames, float sceneEv) {
         int rotation = Math.floorMod(degrees, 360);
         if (rotation % 90 != 0) throw new IllegalArgumentException("无效的照片方向");
         boolean swap = rotation % 180 != 0;
@@ -171,10 +177,13 @@ final class RawRenderer {
             float mm = LensCatalog.equivalent(sensor, shot.get(CaptureResult.LENS_FOCAL_LENGTH));
             Integer iso = shot.get(CaptureResult.SENSOR_SENSITIVITY);
             float[] noise = readNoiseProfile(shot);
+            boolean useWideGamut = options.natural && options.wideGamut;
             BayerPipeline.Options pipeOpt = new BayerPipeline.Options();
             pipeOpt.natural = options.natural;
+            pipeOpt.wideGamut = useWideGamut;
             pipeOpt.equivalentMm = mm;
             pipeOpt.iso = iso == null ? 0 : iso;
+            pipeOpt.sceneEv = sceneEv;
             pipeOpt.noiseSlope = noise[0];
             pipeOpt.noiseOffset = noise[1];
             pipeOpt.effectiveFrames = effectiveFrames;
@@ -185,6 +194,9 @@ final class RawRenderer {
 
             BayerPipeline.GainmapData gainmapData = image.render(rotation, pipeOpt,
                     (pixels, x, y, w, h) -> output.setPixels(pixels, 0, w, x, y, w, h));
+            if (useWideGamut) {
+                output.setColorSpace(ColorSpace.get(ColorSpace.Named.DISPLAY_P3));
+            }
             if (gainmapData != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 attachGainmap(output, gainmapData);
             }
@@ -211,9 +223,9 @@ final class RawRenderer {
     }
 
     private static BayerPipeline pipeline(Image raw, CameraCharacteristics sensor, TotalCaptureResult shot,
-                                          int maxEdge, Options options) {
+                                          int maxEdge, Options options, float sceneEv) {
         RawGeometry geo = inspectRaw(raw, sensor, shot);
-        ColorCalibration cal = calibrateColor(sensor, shot, options);
+        ColorCalibration cal = calibrateColor(sensor, shot, options, sceneEv);
         ShadingInfo shade = readShading(shot);
         ShortBuffer data = raw.getPlanes()[0].getBuffer().slice().order(ByteOrder.nativeOrder()).asShortBuffer();
         int width = geo.crop.width(), height = geo.crop.height();
@@ -257,8 +269,23 @@ final class RawRenderer {
         return new ShadingInfo(shading, lens.getColumnCount(), lens.getRowCount());
     }
 
+    static float computeSceneEv(TotalCaptureResult shot) {
+        if (shot == null) return Float.NaN;
+        Float aperture = shot.get(CaptureResult.LENS_APERTURE);
+        Long expNs = shot.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+        Integer iso = shot.get(CaptureResult.SENSOR_SENSITIVITY);
+        if (aperture == null || !(aperture > 0f) || expNs == null || expNs <= 0L || iso == null || iso <= 0) {
+            return Float.NaN;
+        }
+        Integer boost = shot.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST);
+        double effIso = iso * ((boost != null && boost > 0 ? boost : 100) * 0.01);
+        double ev100 = Math.log((aperture * aperture) / (expNs * 1e-9)) / Math.log(2.0)
+                - Math.log(effIso / 100.0) / Math.log(2.0);
+        return Double.isFinite(ev100) ? (float) ev100 : Float.NaN;
+    }
+
     private static ColorCalibration calibrateColor(CameraCharacteristics sensor, TotalCaptureResult shot,
-                                                   Options options) {
+                                                   Options options, float sceneEv) {
         float[] balance = {1, 1, 1, 1};
         RggbChannelVector wb = shot.get(CaptureResult.COLOR_CORRECTION_GAINS);
         if (wb != null) wb.copyTo(balance, 0);
@@ -284,6 +311,18 @@ final class RawRenderer {
         Number illum1 = sensor.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1);
         Number illum2 = sensor.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2);
 
+        boolean useWideGamut = options.natural && options.wideGamut;
+        float ambienceRetention = 0f;
+        if (options.natural && options.manualKelvin < 2000f) {
+            if (Float.isFinite(sceneEv)) {
+                float t = Math.max(0f, Math.min(1f, (9.0f - sceneEv) / 3.5f));
+                float dimFactor = t * t * (3f - 2f * t);
+                ambienceRetention = 0.12f + 0.12f * dimFactor;
+            } else {
+                ambienceRetention = 0.18f;
+            }
+        }
+
         float[] transform;
         if (options.natural && neutral != null
                 && (SensorColorMatrix.isUsable(color1) || SensorColorMatrix.isUsable(forward1))) {
@@ -291,7 +330,8 @@ final class RawRenderer {
                     neutral, cal1, cal2, color1, color2, forward1, forward2,
                     illum1 == null ? 0 : illum1.intValue(),
                     illum2 == null ? 0 : illum2.intValue(),
-                    true, options.manualKelvin, options.manualTint);
+                    true, options.manualKelvin, options.manualTint,
+                    useWideGamut, ambienceRetention);
             float greenMean = (balance[1] + balance[2]) * 0.5f;
             if (!(greenMean > 0)) greenMean = 1f;
             balance = new float[]{
@@ -303,6 +343,7 @@ final class RawRenderer {
             transform = calibrated.wbMatrix;
         } else if (wb != null && SensorColorMatrix.isUsable(halTransform)) {
             transform = options.natural ? SensorColorMatrix.normalizeCcmRows(halTransform) : halTransform;
+            if (useWideGamut) transform = SensorColorMatrix.srgbMatrixToDisplayP3(transform);
         } else {
             if (neutral == null) throw new IllegalArgumentException("相机没有提供本次拍摄的白平衡");
             transform = SensorColorMatrix.fromDng(neutral, cal1, cal2, color1, color2, forward1, forward2,
@@ -315,11 +356,15 @@ final class RawRenderer {
         Integer postRaw = shot.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST);
         float exposure = postRaw != null && postRaw > 0 ? postRaw * 0.01f : 1f;
         Integer ae = shot.get(CaptureResult.CONTROL_AE_STATE);
-        if (Math.abs(options.userEvBias) < 0.05f && ae != null
-                && (ae == CaptureResult.CONTROL_AE_STATE_CONVERGED
-                || ae == CaptureResult.CONTROL_AE_STATE_LOCKED
-                || ae == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED)) {
-            float ev = meteredBias(sensor, shot);
+        if (Math.abs(options.userEvBias) < 0.05f) {
+            float ev = Float.NaN;
+            if (ae != null && (ae == CaptureResult.CONTROL_AE_STATE_CONVERGED
+                    || ae == CaptureResult.CONTROL_AE_STATE_LOCKED
+                    || ae == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED)) {
+                ev = meteredBias(sensor, shot);
+            } else if (Float.isFinite(options.fallbackMeteredBiasEv)) {
+                ev = options.fallbackMeteredBiasEv;
+            }
             if (ev < 0) exposure *= (float) Math.pow(2, 0.8 * Math.min(1f, -ev));
         }
         for (int i = 0; i < transform.length; i++) transform[i] *= exposure;

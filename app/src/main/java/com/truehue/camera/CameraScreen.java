@@ -15,6 +15,11 @@ import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.graphics.drawable.StateListDrawable;
 import android.os.Build;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.TextUtils;
+import android.text.style.AbsoluteSizeSpan;
+import android.text.style.ForegroundColorSpan;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
@@ -46,9 +51,9 @@ final class CameraScreen extends LinearLayout {
     final TextView prompt, action, status, dimensions, telemetry, evBadge;
     final TextView modeBadge, hdrToggle, dngToggle;
     final FrameLayout gallery;
-    final Mark mode, shutter, filterButton, gridButton;
+    final Mark helpButton, mode, shutter, filterButton, gridButton;
     final LensRail lensBar, filterBar;
-    final TextView evChip, wbChip, evReadout, wbReadout, filterDesc;
+    final TextView evChip, wbChip, evReadout, wbReadout, filterDesc, filterCaption;
     final TextView evResetBtn, evCloseBtn, wbCloseBtn;
     final LinearLayout wbPresetRow;
     final DialWheel evWheel, wbWheel;
@@ -57,7 +62,7 @@ final class CameraScreen extends LinearLayout {
     private final LinearLayout lensRow, filterTray, evTray, wbTray;
     private final Mark galleryMark;
     private final View curtain, exposureBlink;
-    private boolean hasLenses;
+    private boolean hasLenses, proInfoVisible;
     private int activeTray = TRAY_LENS;
     private float aspect = 0.75f;
 
@@ -67,49 +72,56 @@ final class CameraScreen extends LinearLayout {
         setBackgroundColor(BG);
         useSystemInsets(this);
 
-        // 1. Compact Top Optical Status & Toggle Bar (48dp)
-        LinearLayout header = new LinearLayout(context);
+        // 1. Top status and controls. Use a second row when the labels need more space.
+        LinearLayout quickChips = new LinearLayout(context);
+        quickChips.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout headerTools = new LinearLayout(context);
+        LinearLayout header = new LinearLayout(context) {
+            @Override protected void onMeasure(int widthSpec, int heightSpec) {
+                int unconstrained = MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED);
+                quickChips.measure(unconstrained, unconstrained);
+                headerTools.measure(unconstrained, unconstrained);
+                int available = MeasureSpec.getSize(widthSpec) - getPaddingLeft() - getPaddingRight();
+                boolean stack = MeasureSpec.getMode(widthSpec) != MeasureSpec.UNSPECIFIED
+                        && quickChips.getMeasuredWidth() + headerTools.getMeasuredWidth() > available;
+                setOrientation(stack ? VERTICAL : HORIZONTAL);
+                LayoutParams chipsSize = (LayoutParams) quickChips.getLayoutParams();
+                chipsSize.width = stack ? LayoutParams.MATCH_PARENT : 0;
+                chipsSize.weight = stack ? 0 : 1;
+                super.onMeasure(widthSpec, heightSpec);
+            }
+        };
         header.setGravity(Gravity.CENTER_VERTICAL);
         header.setPadding(dp(14), dp(2), dp(10), dp(2));
-        header.setMinimumHeight(dp(48));
         addView(header, row(-2));
+        header.addView(quickChips, new LayoutParams(0, -2, 1));
+        LayoutParams toolsSize = new LayoutParams(-2, -2);
+        toolsSize.gravity = Gravity.END | Gravity.CENTER_VERTICAL;
+        header.addView(headerTools, toolsSize);
 
         ImageView logo = new ImageView(context);
         logo.setImageResource(R.drawable.ic_camera);
         logo.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
         LinearLayout.LayoutParams logoLp = square(20);
         logoLp.setMarginEnd(dp(8));
-        header.addView(logo, logoLp);
+        quickChips.addView(logo, logoLp);
 
-        modeBadge = pill("RAW", 11, INK, ELEVATED, LINE);
+        modeBadge = pill("原彩", 11, INK, ELEVATED, LINE);
         modeBadge.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        header.addView(modeBadge, pillLp(6));
+        quickChips.addView(modeBadge, pillLp(5));
 
-        hdrToggle = pill("ProXDR", 11, MUTED, PANEL, LINE);
-        hdrToggle.setContentDescription("高动态 ProXDR 开关");
+        hdrToggle = pill("亮彩", 11, MUTED, PANEL, LINE);
+        hdrToggle.setContentDescription("高光亮彩开关，原 ProXDR");
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) hdrToggle.setVisibility(GONE);
-        header.addView(hdrToggle, pillLp(6));
+        quickChips.addView(hdrToggle, pillLp(5));
 
-        dngToggle = pill("DNG", 11, MUTED, PANEL, LINE);
-        dngToggle.setContentDescription("同时保留 DNG 原始底片开关");
-        header.addView(dngToggle, pillLp(6));
+        dngToggle = pill("存底片", 11, MUTED, PANEL, LINE);
+        dngToggle.setContentDescription("同时保存专业底片（DNG）开关");
+        quickChips.addView(dngToggle, pillLp(5));
 
-        View spacer = new View(context);
-        header.addView(spacer, new LayoutParams(0, 1, 1));
-
-        gridButton = new Mark(context, Mark.GRID);
-        gridButton.setContentDescription("构图辅助线与水平仪");
-        gridButton.setTooltipText("辅助线与水平仪");
-        gridButton.setFocusable(true);
-        gridButton.setForeground(ripple(16));
-        header.addView(gridButton, square(42));
-
-        mode = new Mark(context, Mark.SETTINGS);
-        mode.setContentDescription("拍摄设置");
-        mode.setTooltipText("拍摄设置");
-        mode.setFocusable(true);
-        mode.setForeground(ripple(16));
-        header.addView(mode, square(44));
+        helpButton = headerButton(headerTools, Mark.HELP, 5, "新手指南与名词说明", "使用指南");
+        gridButton = headerButton(headerTools, Mark.GRID, 5, "构图辅助线与水平仪", "辅助线与水平仪");
+        mode = headerButton(headerTools, Mark.SETTINGS, 4, "拍摄设置", "拍摄设置");
 
         // 2. Full-Width 4:3 Edge-to-Edge Viewfinder Stage
         FrameLayout stage = new FrameLayout(context) {
@@ -175,14 +187,14 @@ final class CameraScreen extends LinearLayout {
         evBadge = pill("", 10, ACCENT, ACCENT_PILL, ACCENT);
         evBadge.setVisibility(GONE);
         LayoutParams evBadgeLp = new LayoutParams(-2, -2);
-        evBadgeLp.setMarginStart(dp(6));
+        evBadgeLp.setMarginEnd(dp(8));
         meta.addView(evBadge, evBadgeLp);
 
         status = label("启动中", 11, MUTED);
-        status.setGravity(Gravity.END);
+        status.setGravity(Gravity.START);
         status.setMaxLines(1);
+        status.setEllipsize(TextUtils.TruncateAt.END);
         status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
-        status.setPaddingRelative(dp(8), 0, 0, 0);
         meta.addView(status, stretch());
 
         dimensions = label("", 11, MUTED);
@@ -202,9 +214,9 @@ final class CameraScreen extends LinearLayout {
         lensRow.setGravity(Gravity.CENTER_VERTICAL);
         trayHost.addView(lensRow, new FrameLayout.LayoutParams(-1, -2, Gravity.CENTER));
 
-        evChip = chipButton("EV");
-        evChip.setContentDescription("曝光补偿调节");
-        lensRow.addView(evChip, new LayoutParams(dp(54), dp(38)));
+        evChip = chipButton("亮度");
+        evChip.setContentDescription("调节画面亮度");
+        lensRow.addView(evChip, new LayoutParams(dp(56), dp(38)));
 
         FrameLayout lensCenter = new FrameLayout(context);
         lensRow.addView(lensCenter, new LayoutParams(0, -2, 1));
@@ -214,9 +226,9 @@ final class CameraScreen extends LinearLayout {
         lensBar.setVisibility(GONE);
         lensCenter.addView(lensBar, new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER));
 
-        wbChip = chipButton("AWB");
-        wbChip.setContentDescription("白平衡色温调节");
-        lensRow.addView(wbChip, new LayoutParams(dp(58), dp(38)));
+        wbChip = chipButton("色调");
+        wbChip.setContentDescription("调节画面冷暖色调");
+        lensRow.addView(wbChip, new LayoutParams(dp(56), dp(38)));
 
         // 4b. Look / Filter Drawer
         filterTray = new LinearLayout(context);
@@ -246,8 +258,8 @@ final class CameraScreen extends LinearLayout {
         LinearLayout evHead = new LinearLayout(context);
         evHead.setGravity(Gravity.CENTER_VERTICAL);
         evTray.addView(evHead, row(-2));
-        evHead.addView(label("曝光补偿", 12, MUTED), new LayoutParams(-2, -2));
-        evReadout = label("0.0 EV", 12, ACCENT);
+        evHead.addView(label("画面亮度", 12, MUTED), new LayoutParams(-2, -2));
+        evReadout = label("标准", 12, ACCENT);
         evReadout.setFontFeatureSettings("tnum");
         evReadout.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         evReadout.setPaddingRelative(dp(8), 0, 0, 0);
@@ -262,6 +274,17 @@ final class CameraScreen extends LinearLayout {
         wheelLp.topMargin = dp(4);
         evTray.addView(evWheel, wheelLp);
 
+        LinearLayout evHints = new LinearLayout(context);
+        evHints.setGravity(Gravity.CENTER_VERTICAL);
+        LayoutParams evHintsLp = row(-2);
+        evHintsLp.topMargin = dp(2);
+        evTray.addView(evHints, evHintsLp);
+        evHints.addView(label("← 更暗", 10, MUTED), new LayoutParams(-2, -2));
+        TextView evHintMid = label("左右滑动调明暗，也可在画面上下滑", 10, MUTED);
+        evHintMid.setGravity(Gravity.CENTER);
+        evHints.addView(evHintMid, stretch());
+        evHints.addView(label("更亮 →", 10, MUTED), new LayoutParams(-2, -2));
+
         // 4d. WB Dial Drawer
         wbTray = new LinearLayout(context);
         wbTray.setOrientation(VERTICAL);
@@ -273,7 +296,7 @@ final class CameraScreen extends LinearLayout {
         LinearLayout wbHead = new LinearLayout(context);
         wbHead.setGravity(Gravity.CENTER_VERTICAL);
         wbTray.addView(wbHead, row(-2));
-        wbReadout = label("自动白平衡", 12, ACCENT);
+        wbReadout = label("自动色调", 12, ACCENT);
         wbReadout.setFontFeatureSettings("tnum");
         wbReadout.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
         wbHead.addView(wbReadout, new LayoutParams(-2, -2));
@@ -289,16 +312,29 @@ final class CameraScreen extends LinearLayout {
         wbWheelLp.topMargin = dp(4);
         wbTray.addView(wbWheel, wbWheelLp);
 
+        LinearLayout wbHints = new LinearLayout(context);
+        wbHints.setGravity(Gravity.CENTER_VERTICAL);
+        LayoutParams wbHintsLp = row(-2);
+        wbHintsLp.topMargin = dp(2);
+        wbTray.addView(wbHints, wbHintsLp);
+        wbHints.addView(label("← 偏冷去黄", 10, MUTED), new LayoutParams(-2, -2));
+        TextView wbHintMid = label("滑动刻度调整冷暖", 10, MUTED);
+        wbHintMid.setGravity(Gravity.CENTER);
+        wbHints.addView(wbHintMid, stretch());
+        wbHints.addView(label("偏暖柔和 →", 10, MUTED), new LayoutParams(-2, -2));
+
         // 5. Primary Shutter Deck
         FrameLayout controls = new FrameLayout(context);
-        controls.setPadding(dp(30), dp(4), dp(30), dp(14));
+        controls.setPadding(dp(28), dp(4), dp(28), dp(12));
         addView(controls, row(-2));
 
+        LinearLayout galleryWrap = column();
+        controls.addView(galleryWrap, new FrameLayout.LayoutParams(-2, -2, Gravity.START | Gravity.CENTER_VERTICAL));
         gallery = new FrameLayout(context);
         gallery.setBackground(rounded(PANEL, 13, LINE));
         gallery.setForeground(ripple(13));
         gallery.setClipToOutline(true);
-        controls.addView(gallery, squareAt(50, Gravity.START | Gravity.CENTER_VERTICAL));
+        galleryWrap.addView(gallery, square(46));
         galleryMark = new Mark(context, Mark.GALLERY);
         gallery.addView(galleryMark, new FrameLayout.LayoutParams(-1, -1));
         thumbnail = new ImageView(context);
@@ -308,6 +344,11 @@ final class CameraScreen extends LinearLayout {
         gallery.setContentDescription("查看上张照片");
         gallery.setTooltipText("上张照片");
         gallery.setFocusable(true);
+        TextView galleryCaption = label("相册", 10, MUTED);
+        galleryCaption.setOnClickListener(v -> gallery.performClick());
+        LayoutParams capLp = new LayoutParams(-2, -2);
+        capLp.topMargin = dp(3);
+        galleryWrap.addView(galleryCaption, capLp);
 
         shutter = new Mark(context, Mark.SHUTTER);
         controls.addView(shutter, squareAt(76, Gravity.CENTER));
@@ -315,20 +356,41 @@ final class CameraScreen extends LinearLayout {
         shutter.setForeground(ripple(40));
         shutter.setContentDescription("拍照");
 
+        LinearLayout filterWrap = column();
+        controls.addView(filterWrap, new FrameLayout.LayoutParams(-2, -2, Gravity.END | Gravity.CENTER_VERTICAL));
         filterButton = new Mark(context, Mark.FILTER);
         StateListDrawable filterBackground = new StateListDrawable();
         filterBackground.addState(new int[]{android.R.attr.state_selected}, rounded(ACCENT_PILL, 13, ACCENT));
         filterBackground.addState(new int[0], rounded(PANEL, 13, LINE));
         filterButton.setBackground(filterBackground);
         filterButton.setForeground(ripple(13));
-        controls.addView(filterButton, squareAt(50, Gravity.END | Gravity.CENTER_VERTICAL));
+        filterWrap.addView(filterButton, square(46));
         filterButton.setFocusable(true);
+        filterCaption = label("风格", 10, MUTED);
+        filterCaption.setOnClickListener(v -> filterButton.performClick());
+        LayoutParams fCapLp = new LayoutParams(-2, -2);
+        fCapLp.topMargin = dp(3);
+        filterWrap.addView(filterCaption, fCapLp);
+
+        setProInfoVisible(false);
+    }
+
+    private Mark headerButton(LinearLayout tools, int kind, int insetDp, String description, String tooltip) {
+        Mark button = new Mark(getContext(), kind);
+        int inset = dp(insetDp);
+        button.setPadding(inset, inset, inset, inset);
+        button.setContentDescription(description);
+        button.setTooltipText(tooltip);
+        button.setFocusable(true);
+        button.setForeground(ripple(16));
+        tools.addView(button, square(48));
+        return button;
     }
 
     private TextView pill(String text, int sp, int color, int bg, int stroke) {
         TextView view = label(text, sp, color);
         view.setGravity(Gravity.CENTER);
-        view.setPadding(dp(10), dp(5), dp(10), dp(5));
+        view.setPadding(dp(8), dp(5), dp(8), dp(5));
         view.setMinHeight(dp(26));
         view.setBackground(rounded(bg, 13, stroke));
         view.setForeground(ripple(13));
@@ -353,26 +415,49 @@ final class CameraScreen extends LinearLayout {
         return view;
     }
 
-    void updateQuickChips(boolean hdrOn, boolean dngOn, boolean gridOn) {
-        styleTogglePill(hdrToggle, hdrOn);
-        styleTogglePill(dngToggle, dngOn);
-        gridButton.setSelected(gridOn);
+    void setShowGrid(boolean show) {
+        overlay.setShowGrid(show);
+        gridButton.setSelected(show);
         gridButton.invalidate();
     }
 
-    private void styleTogglePill(TextView pill, boolean active) {
-        pill.setTextColor(active ? ACCENT : MUTED);
-        pill.setBackground(rounded(active ? ACCENT_PILL : PANEL, 13, active ? ACCENT : LINE));
+    void updateQuickToggle(TextView pill, boolean available, boolean checked, boolean controlsEnabled) {
+        boolean active = available && checked;
+        boolean enabled = available && controlsEnabled;
+        if (pill.isSelected() != active) {
+            pill.setTextColor(active ? ACCENT : MUTED);
+            pill.setBackground(rounded(active ? ACCENT_PILL : PANEL, 13, active ? ACCENT : LINE));
+        }
+        pill.setSelected(active);
+        pill.setEnabled(enabled);
+        pill.setAlpha(enabled ? 1f : .55f);
+        pill.setStateDescription(!available ? "当前拍摄模式下不可用" : active ? "已开启" : "已关闭");
+    }
+
+    void setProInfoVisible(boolean visible) {
+        proInfoVisible = visible;
+        telemetry.setVisibility(visible ? VISIBLE : GONE);
+        dimensions.setVisibility(visible && activeTray == TRAY_LENS ? VISIBLE : GONE);
+        LayoutParams lp = (LayoutParams) evBadge.getLayoutParams();
+        lp.setMarginStart(visible ? dp(6) : 0);
+        lp.setMarginEnd(visible ? 0 : dp(8));
+        evBadge.setLayoutParams(lp);
+        status.setGravity(visible ? Gravity.END : Gravity.START);
+        status.setPaddingRelative(visible ? dp(8) : 0, 0, 0, 0);
     }
 
     void updateProChips(float userEv, float manualKelvin) {
         boolean evActive = Math.abs(userEv) >= 0.05f || activeTray == TRAY_EV;
-        evChip.setText(Math.abs(userEv) < 0.05f ? "EV" : String.format(Locale.ROOT, "%+.1f", userEv));
+        evChip.setText(Math.abs(userEv) < 0.05f ? "亮度" : String.format(Locale.ROOT, "%+.1f", userEv));
         evChip.setTextColor(evActive ? ACCENT : INK);
         evChip.setBackground(rounded(evActive ? ACCENT_PILL : PANEL, 19, evActive ? ACCENT : LINE));
 
         boolean wbActive = manualKelvin >= 2000f || activeTray == TRAY_WB;
-        wbChip.setText(manualKelvin >= 2000f ? Math.round(manualKelvin) + "K" : "AWB");
+        String wbText = "色调";
+        if (manualKelvin >= 2000f) {
+            wbText = manualKelvin < 4800f ? "偏冷" : (manualKelvin <= 5900f ? "自然" : "偏暖");
+        }
+        wbChip.setText(wbText);
         wbChip.setTextColor(wbActive ? ACCENT : INK);
         wbChip.setBackground(rounded(wbActive ? ACCENT_PILL : PANEL, 19, wbActive ? ACCENT : LINE));
     }
@@ -380,32 +465,31 @@ final class CameraScreen extends LinearLayout {
     void updateTelemetry(CameraInput.Telemetry t, boolean highlightProtect, float userEv) {
         if (t == null) {
             telemetry.setText("");
-            evBadge.setVisibility(GONE);
-            return;
+        } else {
+            StringBuilder sb = new StringBuilder();
+            if (t.aperture > 0) sb.append(String.format(Locale.ROOT, "f/%.2f", t.aperture));
+            if (t.exposureNs > 0) {
+                if (sb.length() > 0) sb.append(" · ");
+                double sec = t.exposureNs * 1e-9;
+                if (sec >= 0.5) sb.append(String.format(Locale.ROOT, "%.1fs", sec));
+                else sb.append("1/").append(Math.max(1, Math.round(1.0 / sec))).append("s");
+            }
+            if (t.iso > 0) {
+                if (sb.length() > 0) sb.append(" · ");
+                sb.append("ISO ").append(t.iso);
+            }
+            if (t.kelvin > 0) {
+                if (sb.length() > 0) sb.append(" · ");
+                sb.append(t.kelvin).append("K");
+            }
+            telemetry.setText(sb.toString());
         }
-        StringBuilder sb = new StringBuilder();
-        if (t.aperture > 0) sb.append(String.format(Locale.ROOT, "f/%.2f", t.aperture));
-        if (t.exposureNs > 0) {
-            if (sb.length() > 0) sb.append(" · ");
-            double sec = t.exposureNs * 1e-9;
-            if (sec >= 0.5) sb.append(String.format(Locale.ROOT, "%.1fs", sec));
-            else sb.append("1/").append(Math.max(1, Math.round(1.0 / sec))).append("s");
-        }
-        if (t.iso > 0) {
-            if (sb.length() > 0) sb.append(" · ");
-            sb.append("ISO ").append(t.iso);
-        }
-        if (t.kelvin > 0) {
-            if (sb.length() > 0) sb.append(" · ");
-            sb.append(t.kelvin).append("K");
-        }
-        telemetry.setText(sb.toString());
 
         if (Math.abs(userEv) >= 0.05f) {
-            evBadge.setText(String.format(Locale.ROOT, "%+.1f EV", userEv));
+            evBadge.setText(String.format(Locale.ROOT, "亮度 %+.1f", userEv));
             evBadge.setVisibility(VISIBLE);
-        } else if (highlightProtect) {
-            evBadge.setText("高光保护");
+        } else if (highlightProtect && t != null) {
+            evBadge.setText("自动防过曝");
             evBadge.setVisibility(VISIBLE);
         } else {
             evBadge.setVisibility(GONE);
@@ -434,6 +518,8 @@ final class CameraScreen extends LinearLayout {
         filterButton.setTooltipText(name);
         filterButton.setActivated(selected != PhotoFilter.ORIGINAL);
         filterButton.invalidate();
+        filterCaption.setText(selected == PhotoFilter.ORIGINAL ? "风格" : selected.label);
+        filterCaption.setTextColor(selected == PhotoFilter.ORIGINAL ? MUTED : ACCENT);
         filterDesc.setText(selected.description);
         for (int i = 0; i < filterBar.getChildCount(); i++) {
             TextView choice = (TextView) filterBar.getChildAt(i);
@@ -451,7 +537,7 @@ final class CameraScreen extends LinearLayout {
         filterTray.setVisibility(tray == TRAY_FILTER ? VISIBLE : GONE);
         evTray.setVisibility(tray == TRAY_EV ? VISIBLE : GONE);
         wbTray.setVisibility(tray == TRAY_WB ? VISIBLE : GONE);
-        dimensions.setVisibility(tray == TRAY_LENS ? VISIBLE : GONE);
+        dimensions.setVisibility(proInfoVisible && tray == TRAY_LENS ? VISIBLE : GONE);
         filterButton.setSelected(tray == TRAY_FILTER);
         filterButton.invalidate();
     }
@@ -527,11 +613,12 @@ final class CameraScreen extends LinearLayout {
             if (reuse) {
                 button = (TextView) lensBar.getChildAt(i);
             } else {
-                button = label("", 13, INK);
+                button = label("", 12, INK);
                 button.setFontFeatureSettings("tnum");
                 button.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
                 button.setGravity(Gravity.CENTER);
-                button.setMinHeight(dp(38));
+                button.setMinHeight(dp(42));
+                button.setLineSpacing(dp(1), 1f);
                 button.setPadding(dp(2), dp(4), dp(2), dp(4));
                 button.setFocusable(true);
                 button.setTag(lens.id);
@@ -546,7 +633,14 @@ final class CameraScreen extends LinearLayout {
                 selection.select(lens);
             });
             boolean active = lens.id.equals(selected);
-            button.setText(focal.isEmpty() ? lens.label : focal);
+            SpannableStringBuilder lensText = new SpannableStringBuilder(lens.label);
+            if (lens.equivalentMm > 0) {
+                int subStart = lensText.length();
+                lensText.append('\n').append(Integer.toString(lens.equivalentMm)).append("mm");
+                lensText.setSpan(new AbsoluteSizeSpan(9, true), subStart, lensText.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                lensText.setSpan(new ForegroundColorSpan(active ? ACCENT : MUTED), subStart, lensText.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+            button.setText(lensText);
             button.setSelected(active);
             button.setTextColor(active ? ACCENT : INK);
             if (active) lensBar.select(i);
@@ -567,11 +661,11 @@ final class CameraScreen extends LinearLayout {
         shutter.setAlpha(ready ? 1f : .36f);
         filterButton.setEnabled(ready && !busy);
         filterButton.setAlpha(ready && !busy ? 1f : .45f);
+        helpButton.setEnabled(!busy);
+        helpButton.setAlpha(!busy ? 1f : .55f);
         mode.setEnabled(ready && !busy);
         mode.setAlpha(ready && !busy ? 1f : .55f);
         modeBadge.setEnabled(ready && !busy);
-        hdrToggle.setEnabled(ready && !busy);
-        dngToggle.setEnabled(ready && !busy);
         evChip.setEnabled(ready && !busy);
         wbChip.setEnabled(ready && !busy);
         for (LensRail bar : new LensRail[]{lensBar, filterBar}) {
@@ -933,7 +1027,7 @@ final class CameraScreen extends LinearLayout {
             if (focusLocked) {
                 paint.setTextSize(dp(11));
                 paint.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-                String text = "AE/AF 锁定";
+                String text = "已锁定对焦与亮度";
                 float tw = paint.measureText(text);
                 float pw = tw + dp(20), ph = dp(24);
                 lockPill.set(w * 0.5f - pw * 0.5f, dp(10), w * 0.5f + pw * 0.5f, dp(10) + ph);
@@ -1012,7 +1106,7 @@ final class CameraScreen extends LinearLayout {
     }
 
     static final class Mark extends View {
-        static final int SHUTTER = 0, FILTER = 1, GALLERY = 2, SETTINGS = 3, BACK = 4, GRID = 5, SHARE = 6;
+        static final int SHUTTER = 0, FILTER = 1, GALLERY = 2, SETTINGS = 3, BACK = 4, GRID = 5, SHARE = 6, HELP = 7;
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final RectF arcBounds = new RectF();
         private final int kind;
@@ -1058,7 +1152,9 @@ final class CameraScreen extends LinearLayout {
 
         @Override protected void onDraw(Canvas canvas) {
             canvas.save();
-            canvas.scale(getWidth() / 48f, getHeight() / 48f);
+            canvas.translate(getPaddingLeft(), getPaddingTop());
+            canvas.scale((getWidth() - getPaddingLeft() - getPaddingRight()) / 48f,
+                    (getHeight() - getPaddingTop() - getPaddingBottom()) / 48f);
             paint.setColor(isSelected() ? ACCENT : INK);
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(1.65f);
@@ -1124,6 +1220,16 @@ final class CameraScreen extends LinearLayout {
                     canvas.drawLine(15, 25, 15, 34, paint);
                     canvas.drawLine(15, 34, 33, 34, paint);
                     canvas.drawLine(33, 34, 33, 25, paint);
+                    break;
+                case HELP:
+                    paint.setStrokeWidth(1.45f);
+                    canvas.drawCircle(24, 24, 12.2f, paint);
+                    paint.setStrokeWidth(1.65f);
+                    arcBounds.set(20.6f, 16.8f, 27.4f, 23.4f);
+                    canvas.drawArc(arcBounds, 200f, 225f, false, paint);
+                    canvas.drawLine(24, 23.4f, 24, 26.8f, paint);
+                    paint.setStyle(Paint.Style.FILL);
+                    canvas.drawCircle(24, 30.6f, 1.15f, paint);
                     break;
                 default: break;
             }

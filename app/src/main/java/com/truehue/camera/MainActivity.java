@@ -7,6 +7,7 @@ import android.app.Dialog;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.ImageFormat;
@@ -70,17 +71,22 @@ public final class MainActivity extends Activity implements SensorEventListener 
     private String selectedLens;
 
     private boolean sameFrame, keepDng, liveRaw, multiFrame, ultraHdr, showGrid, showHistogram;
+    private boolean showProInfo, guideShown;
     private boolean proofUnavailable, proofInFlight, waitingForProof, dialogOpen;
     private PhotoFilter filter;
     private Runnable unregisterTrayBack;
-    private boolean naturalLight, compareBaseline;
+    private boolean compareBaseline; // Set only by the paired instrumented capture test.
     private float userEvBias, manualKelvin, manualTint;
-    private boolean highlightProtecting;
+    private boolean highlightProtecting, showingTransientStatus;
     private CameraInput.Telemetry latestTelemetry;
-
-    private final Runnable nextProof = this::requestRawPreview;
     private boolean foreground, ready, busy;
     private long shutterTime;
+
+    private final Runnable nextProof = this::requestRawPreview;
+    private final Runnable clearStatus = () -> {
+        showingTransientStatus = false;
+        if (ready && !busy) setStatus();
+    };
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -91,22 +97,25 @@ public final class MainActivity extends Activity implements SensorEventListener 
         multiFrame = prefs.getBoolean("multiFrame", true);
         ultraHdr = prefs.getBoolean("ultraHdr", Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE);
         showGrid = prefs.getBoolean("showGrid", true);
-        showHistogram = prefs.getBoolean("showHistogram", true);
+        showHistogram = prefs.getBoolean("showHistogram", false);
+        showProInfo = prefs.getBoolean("showProInfo", false);
+        guideShown = prefs.getBoolean("guideShown", false);
         filter = PhotoFilter.fromId(prefs.getString("photoFilter", null));
-        naturalLight = prefs.getBoolean("naturalLight", true);
-        compareBaseline = prefs.getBoolean("compareBaseline", false);
 
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        getWindow().setColorMode(ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT);
         ui = new CameraScreen(this);
         setContentView(ui);
         ui.showThumbnail(null, false);
-        ui.overlay.setShowGrid(showGrid);
+        ui.setShowGrid(showGrid);
         ui.overlay.setShowHistogram(showHistogram);
-        ui.updateQuickChips(ultraHdr, keepDng, showGrid);
+        ui.setProInfoVisible(showProInfo);
+        updateQuickToggles();
         ui.updateProChips(userEvBias, manualKelvin);
 
         ui.shutter.setOnClickListener(v -> pressShutter());
         ui.gallery.setOnClickListener(v -> review());
+        ui.helpButton.setOnClickListener(v -> showGuide());
         ui.filterButton.setOnClickListener(v -> {
             if (ready && !busy && !dialogOpen) {
                 setTrayOpen(ui.activeTray() == CameraScreen.TRAY_FILTER
@@ -134,25 +143,27 @@ public final class MainActivity extends Activity implements SensorEventListener 
         setupWbPresets();
 
         ui.hdrToggle.setOnClickListener(v -> {
-            if (!ready || busy || dialogOpen) return;
+            if (!ready || busy || dialogOpen || !canUseUltraHdr(captureFormat() == ImageFormat.RAW_SENSOR)) {
+                return;
+            }
             ultraHdr = !ultraHdr;
             getPreferences(MODE_PRIVATE).edit().putBoolean("ultraHdr", ultraHdr).apply();
-            ui.updateQuickChips(ultraHdr, keepDng, showGrid);
-            ui.status.setText(ultraHdr ? "ProXDR 高动态已开启" : "ProXDR 已关闭");
+            updateQuickToggles();
+            showTransientStatus(ultraHdr ? "亮彩已开 · 阳光和灯光更通透" : "亮彩已关 · 标准亮度出图", 3000);
         });
         ui.dngToggle.setOnClickListener(v -> {
-            if (!ready || busy || dialogOpen) return;
+            if (!ready || busy || dialogOpen || captureFormat() != ImageFormat.RAW_SENSOR) return;
             keepDng = !keepDng;
             getPreferences(MODE_PRIVATE).edit().putBoolean("keepDng", keepDng).apply();
-            ui.updateQuickChips(ultraHdr, keepDng, showGrid);
-            ui.status.setText(keepDng ? "同时保留 DNG 原始底片" : "仅保存成品 JPEG");
+            updateQuickToggles();
+            showTransientStatus(keepDng ? "存底片已开 · 额外存专业修图文件" : "存底片已关 · 只存普通照片更省空间", 3000);
         });
         ui.gridButton.setOnClickListener(v -> {
             showGrid = !showGrid;
             getPreferences(MODE_PRIVATE).edit().putBoolean("showGrid", showGrid).apply();
-            ui.overlay.setShowGrid(showGrid);
-            ui.updateQuickChips(ultraHdr, keepDng, showGrid);
+            ui.setShowGrid(showGrid);
             updateHorizonSensor();
+            showTransientStatus(showGrid ? "九宫格与水平仪已开 · 帮你把画面拍端正" : "九宫格与水平仪已关", 2800);
         });
 
         ui.setFilterOptions(filter, this::selectFilter);
@@ -173,8 +184,8 @@ public final class MainActivity extends Activity implements SensorEventListener 
     }
 
     private void setupWbPresets() {
-        String[] labels = {"自动", "日光", "阴天", "暖光"};
-        float[] kelvins = {0f, 5500f, 6500f, 3200f};
+        String[] labels = {"自动", "偏冷", "自然", "偏暖"};
+        float[] kelvins = {0f, 3600f, 5500f, 7200f};
         for (int i = 0; i < labels.length; i++) {
             final float k = kelvins[i];
             TextView btn = ui.label(labels[i], 11, CameraScreen.INK);
@@ -205,6 +216,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
                 ui.viewport.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
                 ui.overlay.showFocus(nx, ny, false);
                 camera.focusAndMeter(nx, ny, false);
+                showTransientStatus("已对焦 · 上下滑动可调画面亮度", 2400);
                 return true;
             }
 
@@ -217,6 +229,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
                 ui.viewport.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
                 ui.overlay.showFocus(nx, ny, true);
                 camera.focusAndMeter(nx, ny, true);
+                showTransientStatus("已锁定对焦与亮度 · 轻点画面即可解锁", 3200);
             }
         });
 
@@ -261,8 +274,11 @@ public final class MainActivity extends Activity implements SensorEventListener 
     private void applyUserEv(float ev) {
         userEvBias = Math.round(Math.max(-2.0f, Math.min(2.0f, ev)) * 10f) / 10f;
         ui.evWheel.setValue(userEvBias);
-        ui.evReadout.setText(Math.abs(userEvBias) < 0.05f ? "0.0 EV"
-                : String.format(Locale.ROOT, "%+.1f EV", userEvBias));
+        String readout;
+        if (Math.abs(userEvBias) < 0.05f) readout = "标准";
+        else if (userEvBias > 0) readout = String.format(Locale.ROOT, "变亮 %+.1f", userEvBias);
+        else readout = String.format(Locale.ROOT, "变暗 %+.1f", userEvBias);
+        ui.evReadout.setText(readout);
         ui.updateProChips(userEvBias, manualKelvin);
         ui.updateTelemetry(latestTelemetry, highlightProtecting, userEvBias);
         if (camera != null) camera.setUserExposureEv(userEvBias);
@@ -270,7 +286,12 @@ public final class MainActivity extends Activity implements SensorEventListener 
 
     private void applyManualKelvin(float kelvin) {
         manualKelvin = kelvin >= 2000f ? Math.round(kelvin / 100f) * 100f : 0f;
-        ui.wbReadout.setText(manualKelvin >= 2000f ? Math.round(manualKelvin) + "K" : "自动白平衡");
+        if (manualKelvin >= 2000f) {
+            String tone = manualKelvin < 4800f ? "偏冷" : (manualKelvin <= 5900f ? "自然" : "偏暖");
+            ui.wbReadout.setText(tone + " · " + Math.round(manualKelvin) + "K");
+        } else {
+            ui.wbReadout.setText("自动色调");
+        }
         ui.updateProChips(userEvBias, manualKelvin);
         if (renderer != null) renderer.setWhiteBalancePreview(manualKelvin, manualTint);
         proofUnavailable = false;
@@ -410,6 +431,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
                 setStatus();
                 refreshControls();
                 scheduleProof();
+                if (!guideShown) showGuide();
             }
 
             @Override public void onPhoto(Bitmap bitmap) {
@@ -457,6 +479,8 @@ public final class MainActivity extends Activity implements SensorEventListener 
         ++run;
         ui.coverFinder();
         main.removeCallbacks(nextProof);
+        main.removeCallbacks(clearStatus);
+        showingTransientStatus = false;
         hideProof();
         proofUnavailable = proofInFlight = waitingForProof = false;
         setTrayOpen(CameraScreen.TRAY_LENS);
@@ -485,11 +509,38 @@ public final class MainActivity extends Activity implements SensorEventListener 
 
     private void refreshControls() {
         ui.controls(ready, busy);
+        updateQuickToggles();
+    }
+
+    private void updateQuickToggles() {
+        boolean raw = captureFormat() == ImageFormat.RAW_SENSOR;
+        boolean controlsEnabled = ready && !busy;
+        ui.updateQuickToggle(ui.hdrToggle, canUseUltraHdr(raw), ultraHdr, controlsEnabled);
+        ui.updateQuickToggle(ui.dngToggle, raw, keepDng, controlsEnabled);
+    }
+
+    private static boolean canUseUltraHdr(boolean raw) {
+        return raw && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE;
+    }
+
+    private void showTransientStatus(String text, long durationMs) {
+        main.removeCallbacks(clearStatus);
+        showingTransientStatus = true;
+        ui.status.setText(text);
+        main.postDelayed(clearStatus, durationMs);
     }
 
     private void setStatus() {
-        String label = ui.rawPreview.getVisibility() == View.VISIBLE ? "实时显影" : "";
-        ui.status.setText(ui.activeTray() == CameraScreen.TRAY_FILTER ? "" : label);
+        if (showingTransientStatus) return;
+        if (ui.activeTray() == CameraScreen.TRAY_FILTER) {
+            ui.status.setText("");
+        } else if (ui.rawPreview.getVisibility() == View.VISIBLE) {
+            ui.status.setText("原彩预览中");
+        } else if (!showProInfo) {
+            ui.status.setText("轻点对焦 · 长按锁定 · 上下滑调亮度");
+        } else {
+            ui.status.setText("");
+        }
     }
 
     private void setTrayOpen(int tray) {
@@ -543,13 +594,79 @@ public final class MainActivity extends Activity implements SensorEventListener 
             camera.protectHighlights(false);
             ui.updateTelemetry(latestTelemetry, false, userEvBias);
         }
-        String label = format == ImageFormat.RAW_SENSOR ? "原彩显影" : format == ImageFormat.JPEG ? "原生 JPEG" : "同取景";
-        boolean burst = format == ImageFormat.RAW_SENSOR && multiFrame && camera != null && camera.supportsBurst();
-        String badge = format == ImageFormat.RAW_SENSOR ? (burst ? "MF·RAW" : "RAW")
-                : format == ImageFormat.JPEG ? "JPEG" : "同取景";
+        String label = format == ImageFormat.RAW_SENSOR ? "原彩直出" : format == ImageFormat.JPEG ? "高清直出" : "极速快拍";
+        String badge = format == ImageFormat.RAW_SENSOR ? "原彩" : format == ImageFormat.JPEG ? "高清" : "快拍";
         boolean still = format != ImageFormat.UNKNOWN;
-        ui.setMode(badge, label, format == ImageFormat.RAW_SENSOR ? "RAW" : format == ImageFormat.JPEG ? "JPEG" : "同取景",
-                still ? stillWidth : previewWidth, still ? stillHeight : previewHeight);
+        ui.setMode(badge, label, badge, still ? stillWidth : previewWidth, still ? stillHeight : previewHeight);
+    }
+
+    private void showGuide() {
+        if (!foreground || isFinishing() || busy || dialogOpen) return;
+        setTrayOpen(CameraScreen.TRAY_LENS);
+        dialogOpen = true;
+        main.removeCallbacks(nextProof);
+        Dialog dialog = createGuide();
+        dialog.setOnDismissListener(d -> {
+            dialogOpen = false;
+            scheduleProof();
+        });
+        dialog.show();
+        CameraPanels.fitSheet(dialog, ui);
+        if (!guideShown) {
+            guideShown = true;
+            getPreferences(MODE_PRIVATE).edit().putBoolean("guideShown", true).apply();
+        }
+    }
+
+    private Dialog createGuide() {
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+
+        TextView intro = ui.label("不用懂专业参数，默认设置直接按快门就能拍出自然真实的好照片。", 13, CameraScreen.MUTED);
+        intro.setLineSpacing(ui.dp(2), 1f);
+        intro.setPadding(ui.dp(4), 0, ui.dp(4), ui.dp(6));
+        body.addView(intro);
+
+        body.addView(CameraPanels.section(ui, "3 步快速上手"));
+        LinearLayout quickCard = CameraPanels.card(ui);
+        quickCard.addView(CameraPanels.guideItem(ui, "1. 切镜头：超广角 / 主摄 / 长焦",
+                "拍大风景选「超广角」，日常随手拍选「主摄」，想把远处拉近或拍特写选「长焦」。"));
+        CameraPanels.divider(ui, quickCard);
+        quickCard.addView(CameraPanels.guideItem(ui, "2. 轻点对焦 · 上下滑调亮度 · 长按锁定",
+                "点画面想拍清楚的地方；手指在画面上下滑可调亮暗；长按可锁定对焦与亮度。"));
+        CameraPanels.divider(ui, quickCard);
+        quickCard.addView(CameraPanels.guideItem(ui, "3. 右下角选风格",
+                "提供原彩、光影、柔光、层次、黑白 5 种风格，取景时实时看到效果。"));
+        body.addView(quickCard);
+
+        body.addView(CameraPanels.section(ui, "顶部和底部按钮是什么意思？"));
+        LinearLayout buttonsCard = CameraPanels.card(ui);
+        buttonsCard.addView(CameraPanels.guideItem(ui, "亮彩（原 ProXDR）",
+                "让阳光、灯光和天空在手机屏幕上更有通透立体感，日常推荐开启。"));
+        CameraPanels.divider(ui, buttonsCard);
+        buttonsCard.addView(CameraPanels.guideItem(ui, "存底片（原 DNG）",
+                "额外保存约 20MB 的专业修图原文件（供电脑或专业修图软件后期）。日常发朋友圈不需要，建议关闭更省空间。"));
+        CameraPanels.divider(ui, buttonsCard);
+        buttonsCard.addView(CameraPanels.guideItem(ui, "亮度 / 色调",
+                "觉得太暗太亮就点「亮度」；室内发黄或偏蓝就点「色调」调冷暖。"));
+        CameraPanels.divider(ui, buttonsCard);
+        buttonsCard.addView(CameraPanels.guideItem(ui, "九宫格与水平仪",
+                "显示构图参考线，画面中央水平线变黄说明手机拿端平了。"));
+        body.addView(buttonsCard);
+
+        body.addView(CameraPanels.section(ui, "常见问题与名词解释"));
+        LinearLayout faqCard = CameraPanels.card(ui);
+        faqCard.addView(CameraPanels.guideItem(ui, "原彩直出是什么？",
+                "不做过度磨皮和假锐化，尽量还原眼睛亲眼看到的真实色彩和质感。"));
+        CameraPanels.divider(ui, faqCard);
+        faqCard.addView(CameraPanels.guideItem(ui, "自动防过曝是什么？",
+                "遇到强光或天空时，相机会自动压低一点亮度，避免亮部惨白没有细节。"));
+        CameraPanels.divider(ui, faqCard);
+        faqCard.addView(CameraPanels.guideItem(ui, "想看光圈、快门、ISO 等专业参数？",
+                "点右上角设置图标，在「拍照辅助」中开启「专业拍摄参数」。"));
+        body.addView(faqCard);
+
+        return CameraPanels.sheet(ui, "本色相机 · 新手指南", body, "知道了，开始拍照");
     }
 
     private void chooseMode() {
@@ -558,137 +675,93 @@ public final class MainActivity extends Activity implements SensorEventListener 
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
 
-        // Section 1: Capture source
-        body.addView(CameraPanels.section(ui, "拍摄模式"));
+        boolean rawAvailable = stillFormat == ImageFormat.RAW_SENSOR;
+        body.addView(CameraPanels.section(ui, "拍摄"));
         LinearLayout modeCard = CameraPanels.card(ui);
         RadioGroup modes = new RadioGroup(this);
         RadioButton sensor = new RadioButton(this);
         sensor.setId(View.generateViewId());
         sensor.setEnabled(stillFormat != ImageFormat.UNKNOWN);
-        sensor.setText(stillFormat == ImageFormat.RAW_SENSOR ? "原彩显影 · 使用传感器 RAW" :
-                stillFormat == ImageFormat.JPEG ? "原生 JPEG · 使用相机高分辨率输出" : "此镜头仅开放取景画面");
-        CameraPanels.option(ui, sensor);
+        if (rawAvailable) {
+            CameraPanels.option(ui, sensor, "原彩直出", "从 RAW 显影，保留更多色彩和细节");
+        } else if (stillFormat == ImageFormat.JPEG) {
+            CameraPanels.option(ui, sensor, "高清直出", "保存相机的高分辨率照片");
+        } else {
+            CameraPanels.option(ui, sensor, "当前镜头仅支持快拍", null);
+        }
         modes.addView(sensor);
         RadioButton preview = new RadioButton(this);
         preview.setId(View.generateViewId());
-        preview.setText(R.string.same_frame_label);
-        CameraPanels.option(ui, preview);
+        CameraPanels.option(ui, preview, "极速快拍", "直接保存取景画面");
         modes.addView(preview);
         modeCard.addView(modes);
         body.addView(modeCard);
         modes.check(captureFormat() == ImageFormat.UNKNOWN ? preview.getId() : sensor.getId());
 
-        // Section 2: Quality & HDR
-        body.addView(CameraPanels.section(ui, "画质与色彩"));
-        LinearLayout qualityCard = CameraPanels.card(ui);
         CheckBox mfBox = new CheckBox(this);
-        mfBox.setText("多帧超采降噪（RAW 连拍对齐融合）");
+        CameraPanels.option(ui, mfBox, "多帧降噪", "合成多张照片，减少暗部噪点");
         mfBox.setChecked(multiFrame);
-        CameraPanels.option(ui, mfBox);
-        qualityCard.addView(mfBox);
-
-        CheckBox hdrBox = new CheckBox(this);
-        hdrBox.setText("ProXDR 高动态增益图（OLED 高亮显示）");
-        hdrBox.setChecked(ultraHdr);
-        CameraPanels.option(ui, hdrBox);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            CameraPanels.divider(ui, qualityCard);
-            qualityCard.addView(hdrBox);
+        if (rawAvailable) {
+            CameraPanels.divider(ui, modeCard);
+            modeCard.addView(mfBox);
         }
 
-        CheckBox dng = new CheckBox(this);
-        dng.setText(R.string.keep_dng_label);
-        dng.setChecked(keepDng);
-        CameraPanels.option(ui, dng);
-        CameraPanels.divider(ui, qualityCard);
-        qualityCard.addView(dng);
-        body.addView(qualityCard);
-
-        // Section 3: Finder aids
-        body.addView(CameraPanels.section(ui, "取景辅助"));
+        body.addView(CameraPanels.section(ui, "拍照辅助"));
         LinearLayout finderCard = CameraPanels.card(ui);
-        CheckBox gridBox = new CheckBox(this);
-        gridBox.setText("构图辅助线与水平仪");
-        gridBox.setChecked(showGrid);
-        CameraPanels.option(ui, gridBox);
-        finderCard.addView(gridBox);
+        CheckBox proof = new CheckBox(this);
+        CameraPanels.option(ui, proof, "原彩预览", "预览成片色彩，取景刷新会变慢");
+        proof.setChecked(liveRaw);
+        if (rawAvailable) {
+            finderCard.addView(proof);
+            CameraPanels.divider(ui, finderCard);
+        }
+
+        CheckBox proInfoBox = new CheckBox(this);
+        CameraPanels.option(ui, proInfoBox, "专业拍摄参数", "显示光圈、快门、ISO 和照片尺寸");
+        proInfoBox.setChecked(showProInfo);
+        finderCard.addView(proInfoBox);
 
         CheckBox histBox = new CheckBox(this);
-        histBox.setText("实时亮度直方图");
+        CameraPanels.option(ui, histBox, "直方图", "显示取景画面的亮度分布");
         histBox.setChecked(showHistogram);
-        CameraPanels.option(ui, histBox);
         CameraPanels.divider(ui, finderCard);
         finderCard.addView(histBox);
-
-        CheckBox proof = new CheckBox(this);
-        proof.setText("原彩预览（取景刷新较慢）");
-        proof.setChecked(liveRaw);
-        CameraPanels.option(ui, proof);
-        CameraPanels.divider(ui, finderCard);
-        finderCard.addView(proof);
         body.addView(finderCard);
 
-        // Section 4: Baseline comparison
-        body.addView(CameraPanels.section(ui, "研发对照"));
-        LinearLayout devCard = CameraPanels.card(ui);
-        CheckBox natural = new CheckBox(this);
-        natural.setText("使用 0.5.1 基线显影");
-        natural.setChecked(!naturalLight);
-        CameraPanels.option(ui, natural);
-        devCard.addView(natural);
-
-        CheckBox compare = new CheckBox(this);
-        compare.setText("同时保存同底片的 0.5.1 对照");
-        compare.setChecked(compareBaseline);
-        CameraPanels.option(ui, compare);
-        CameraPanels.divider(ui, devCard);
-        devCard.addView(compare);
-        body.addView(devCard);
-
         Runnable options = () -> {
-            boolean canDevelop = sensor.isChecked() && stillFormat == ImageFormat.RAW_SENSOR;
-            mfBox.setEnabled(canDevelop && !natural.isChecked());
-            hdrBox.setEnabled(canDevelop && !natural.isChecked());
-            natural.setEnabled(canDevelop);
-            compare.setEnabled(canDevelop && !natural.isChecked());
+            boolean canDevelop = sensor.isChecked() && rawAvailable;
+            mfBox.setEnabled(canDevelop);
             proof.setEnabled(canDevelop);
-            dng.setEnabled(canDevelop);
         };
         options.run();
         modes.setOnCheckedChangeListener((group, id) -> options.run());
-        natural.setOnCheckedChangeListener((v, checked) -> options.run());
+
+        TextView version = ui.label(installedVersionLabel(), 12, CameraScreen.MUTED);
+        version.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams versionLp = new LinearLayout.LayoutParams(-1, -2);
+        versionLp.topMargin = ui.dp(14);
+        body.addView(version, versionLp);
 
         dialogOpen = true;
         main.removeCallbacks(nextProof);
         Dialog dialog = CameraPanels.sheet(ui, "拍摄设置", body);
         CameraPanels.sheetActions(ui, body, dialog, "取消", "完成", v -> {
             if (ready) {
-                boolean usePreview = preview.isChecked() && stillFormat != ImageFormat.UNKNOWN;
-                sameFrame = usePreview;
+                sameFrame = preview.isChecked() && stillFormat != ImageFormat.UNKNOWN;
                 multiFrame = mfBox.isChecked();
-                ultraHdr = hdrBox.isChecked();
-                naturalLight = !natural.isChecked();
-                compareBaseline = compare.isChecked();
                 liveRaw = proof.isChecked();
-                keepDng = dng.isChecked();
-                showGrid = gridBox.isChecked();
+                showProInfo = proInfoBox.isChecked();
                 showHistogram = histBox.isChecked();
                 getPreferences(MODE_PRIVATE).edit()
                         .putBoolean("sameFrame", sameFrame)
                         .putBoolean("multiFrame", multiFrame)
-                        .putBoolean("ultraHdr", ultraHdr)
-                        .putBoolean("naturalLight", naturalLight)
-                        .putBoolean("compareBaseline", compareBaseline)
                         .putBoolean("liveRaw", liveRaw)
-                        .putBoolean("keepDng", keepDng)
-                        .putBoolean("showGrid", showGrid)
+                        .putBoolean("showProInfo", showProInfo)
                         .putBoolean("showHistogram", showHistogram)
                         .apply();
-                ui.overlay.setShowGrid(showGrid);
                 ui.overlay.setShowHistogram(showHistogram);
+                ui.setProInfoVisible(showProInfo);
                 if (renderer != null) renderer.setHistogramEnabled(showHistogram);
-                updateHorizonSensor();
-                ui.updateQuickChips(ultraHdr, keepDng, showGrid);
                 proofUnavailable = false;
                 hideProof();
                 displayMode();
@@ -697,9 +770,22 @@ public final class MainActivity extends Activity implements SensorEventListener 
             }
             dialog.dismiss();
         });
-        dialog.setOnDismissListener(d -> { dialogOpen = false; scheduleProof(); });
+        dialog.setOnDismissListener(d -> {
+            dialogOpen = false;
+            scheduleProof();
+        });
         dialog.show();
         CameraPanels.fitSheet(dialog, ui);
+    }
+
+    private String installedVersionLabel() {
+        try {
+            String name = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+            if (name != null && !name.isEmpty()) return getString(R.string.camera_version, name);
+        } catch (PackageManager.NameNotFoundException e) {
+            Log.w("TrueHue", "Cannot read the installed version", e);
+        }
+        return getString(R.string.camera_version_unknown);
     }
 
     private void hideProof() {
@@ -722,8 +808,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
         proofInFlight = true;
         int session = run;
         PhotoFilter selected = filter;
-        boolean natural = naturalLight;
-        RawRenderer.Options opt = buildRenderOptions(selected, natural, false);
+        RawRenderer.Options opt = buildRenderOptions(selected, false);
         camera.capture(0, new CameraInput.PhotoCallback() {
             @Override public void onImage(Image image, CameraCharacteristics sensor, TotalCaptureResult shot, int angle) {
                 Bitmap result = null;
@@ -733,24 +818,24 @@ public final class MainActivity extends Activity implements SensorEventListener 
                     Log.w("TrueHue", "Cannot develop a RAW preview", ex);
                 }
                 Bitmap shown = result;
-                main.post(() -> finishProof(session, natural, selected, shown));
+                main.post(() -> finishProof(session, selected, shown));
             }
-            @Override public void onFailure(String message) { finishProof(session, natural, selected, null); }
+            @Override public void onFailure(String message) { finishProof(session, selected, null); }
         });
     }
 
-    private void finishProof(int session, boolean natural, PhotoFilter selected, Bitmap result) {
+    private void finishProof(int session, PhotoFilter selected, Bitmap result) {
         if (session != run) {
             if (result != null) result.recycle();
             return;
         }
         proofInFlight = false;
-        if (natural != naturalLight || selected != filter || !liveRaw || captureFormat() != ImageFormat.RAW_SENSOR) {
+        if (selected != filter || !liveRaw || captureFormat() != ImageFormat.RAW_SENSOR) {
             if (result != null) result.recycle();
         } else if (result == null) {
             proofUnavailable = true;
             hideProof();
-            if (!busy) ui.status.setText("原彩预览已暂停，可继续拍照");
+            if (!busy && !showingTransientStatus) ui.status.setText("实景预览已暂停，可正常拍照");
         } else if (wantsProof()) {
             boolean first = ui.rawPreview.getVisibility() != View.VISIBLE;
             ui.rawPreview.setImageBitmap(result);
@@ -767,10 +852,9 @@ public final class MainActivity extends Activity implements SensorEventListener 
         }
     }
 
-    private RawRenderer.Options buildRenderOptions(PhotoFilter selected, boolean natural, boolean allowHdr) {
+    private RawRenderer.Options buildRenderOptions(PhotoFilter selected, boolean allowHdr) {
         RawRenderer.Options opt = new RawRenderer.Options();
-        opt.natural = natural;
-        opt.ultraHdr = allowHdr && ultraHdr && natural;
+        opt.ultraHdr = allowHdr && ultraHdr && canUseUltraHdr(captureFormat() == ImageFormat.RAW_SENSOR);
         opt.filter = selected;
         opt.manualKelvin = manualKelvin;
         opt.manualTint = manualTint;
@@ -784,6 +868,8 @@ public final class MainActivity extends Activity implements SensorEventListener 
         ui.shutterFeedback();
         busy = true;
         main.removeCallbacks(nextProof);
+        main.removeCallbacks(clearStatus);
+        showingTransientStatus = false;
         refreshControls();
         shutterTime = System.currentTimeMillis();
         ui.status.setText("正在拍摄…");
@@ -799,79 +885,88 @@ public final class MainActivity extends Activity implements SensorEventListener 
             return;
         }
         long stamp = shutterTime;
-        boolean saveNegative = keepDng;
+        boolean saveNegative = format == ImageFormat.RAW_SENSOR && keepDng;
         PhotoFilter selected = filter;
-        boolean natural = naturalLight, compare = natural && compareBaseline;
+        boolean compare = compareBaseline;
         int lensMm = currentLensMm;
-        RawRenderer.Options opt = buildRenderOptions(selected, natural, true);
+        RawRenderer.Options opt = buildRenderOptions(selected, true);
 
-        if (format == ImageFormat.RAW_SENSOR && multiFrame && natural && !compare
+        if (format == ImageFormat.RAW_SENSOR && multiFrame && !compare
                 && camera != null && camera.supportsBurst()) {
-            int burstCount = camera.latestIso() >= 500 ? 5 : 4;
-            final boolean[] dngSaved = {false};
-            final boolean[] dngFailed = {false};
-            camera.captureBurst(deviceRotation, burstCount, saveNegative, new StillStream.BurstCallback() {
-                @Override public void onProgress(int framesReceived, int totalFrames) {
-                    if (session == run) ui.status.setText("多帧采样 " + framesReceived + "/" + totalFrames);
-                }
-
-                @Override public void onFirstFrameForDng(Image image, CameraCharacteristics info,
-                                                         TotalCaptureResult result, int degrees) {
-                    try {
-                        PhotoStore.saveDng(getApplicationContext(), image, info, result, stamp, degrees);
-                        dngSaved[0] = true;
-                    } catch (IOException | RuntimeException e) {
-                        Log.e("TrueHue", "Optional DNG could not be saved", e);
-                        dngFailed[0] = true;
+            int iso = camera.latestIso();
+            long expNs = camera.latestExposureNs();
+            boolean guard = camera.isHighlightProtected();
+            boolean skipBurstForBrightDaylight = iso > 0 && iso <= 125
+                    && expNs > 0L && expNs <= 10_000_000L && !guard && lensMm < 45;
+            if (!skipBurstForBrightDaylight) {
+                int burstCount = iso >= 800 ? 5 : (iso >= 350 || expNs > 20_000_000L) ? 4 : 3;
+                final boolean[] dngSaved = {false};
+                final boolean[] dngFailed = {false};
+                camera.captureBurst(deviceRotation, burstCount, saveNegative, new StillStream.BurstCallback() {
+                    @Override public void onProgress(int framesReceived, int totalFrames) {
+                        if (session == run) ui.status.setText("连拍合成中 " + framesReceived + "/" + totalFrames);
                     }
-                }
 
-                @Override public void onBurstReady(BurstRawMerger.Result merged, int[] channel,
-                                                   int width, int height, CameraCharacteristics info,
-                                                   TotalCaptureResult refResult, int degrees) {
-                    main.post(() -> {
-                        if (session == run) ui.status.setText("多帧融合显影中…");
-                    });
-                    try {
-                        Bitmap developed = RawRenderer.renderMerged(merged, channel, width, height,
-                                info, refResult, degrees, opt);
-                        Uri saved;
+                    @Override public void onFirstFrameForDng(Image image, CameraCharacteristics info,
+                                                             TotalCaptureResult result, int degrees) {
                         try {
-                            saved = PhotoStore.save(getApplicationContext(), developed, stamp, refResult,
-                                    RawRenderer.meteredBias(info, refResult), true, false, selected, lensMm);
-                        } finally {
-                            developed.recycle();
+                            PhotoStore.saveDng(getApplicationContext(), image, info, result, stamp, degrees);
+                            dngSaved[0] = true;
+                        } catch (IOException | RuntimeException e) {
+                            Log.e("TrueHue", "Optional DNG could not be saved", e);
+                            dngFailed[0] = true;
                         }
-                        String msg = "已保存 · " + merged.frameCount + " 帧融合";
-                        if (dngSaved[0]) msg += " · DNG";
-                        else if (dngFailed[0]) msg += " · DNG失败";
-                        if (opt.ultraHdr && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                            msg += " · ProXDR";
-                        }
-                        photoSaved(saved, msg, stamp, session);
-                    } catch (IOException | RuntimeException | OutOfMemoryError e) {
-                        Log.e("TrueHue", "Cannot save burst capture", e);
-                        main.post(() -> actionFailed(session, "照片保存失败，请检查可用空间后重试"));
                     }
-                }
 
-                @Override public void onFailure(String message) {
-                    actionFailed(session, message);
-                }
-            });
-            return;
+                    @Override public void onBurstReady(BurstRawMerger.Result merged, int[] channel,
+                                                       int width, int height, CameraCharacteristics info,
+                                                       TotalCaptureResult refResult, int degrees,
+                                                       float fallbackGuardEv) {
+                        opt.fallbackMeteredBiasEv = fallbackGuardEv;
+                        main.post(() -> {
+                            if (session == run) ui.status.setText("正在优化画质…");
+                        });
+                        try {
+                            Bitmap developed = RawRenderer.renderMerged(merged, channel, width, height,
+                                    info, refResult, degrees, opt);
+                            Uri saved;
+                            try {
+                                saved = PhotoStore.save(getApplicationContext(), developed, stamp, refResult,
+                                        RawRenderer.meteredBias(info, refResult), true, false, selected, lensMm);
+                            } finally {
+                                developed.recycle();
+                            }
+                            String msg = "照片已保存";
+                            if (dngSaved[0]) msg += " · 含底片";
+                            else if (dngFailed[0]) msg += " · 底片保存失败";
+                            if (opt.ultraHdr) {
+                                msg += " · 亮彩";
+                            }
+                            photoSaved(saved, msg, stamp, session);
+                        } catch (IOException | RuntimeException | OutOfMemoryError e) {
+                            Log.e("TrueHue", "Cannot save burst capture", e);
+                            main.post(() -> actionFailed(session, "照片保存失败，请检查可用空间后重试"));
+                        }
+                    }
+
+                    @Override public void onFailure(String message) {
+                        actionFailed(session, message);
+                    }
+                });
+                return;
+            }
         }
 
         camera.capture(deviceRotation, new CameraInput.PhotoCallback() {
             @Override public void onImage(Image image, CameraCharacteristics sensor, TotalCaptureResult shot, int angle) {
                 main.post(() -> {
-                    if (session == run) ui.status.setText(format == ImageFormat.RAW_SENSOR ? "正在显影原始像素…" : "正在保存照片…");
+                    if (session == run) ui.status.setText(format == ImageFormat.RAW_SENSOR ? "正在生成原彩照片…" : "正在保存照片…");
                 });
                 try {
                     if (image.getFormat() == ImageFormat.JPEG) {
                         Uri saved = PhotoStore.saveDeviceJpeg(getApplicationContext(), image, shot, stamp,
                                 angle, RawRenderer.meteredBias(sensor, shot), selected);
-                        photoSaved(saved, "原生 JPEG 已保存", stamp, session);
+                        photoSaved(saved, "高清照片已保存", stamp, session);
                     } else {
                         developPhoto(image, sensor, shot, angle, opt, compare, saveNegative, lensMm, stamp, session);
                     }
@@ -893,7 +988,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
         } catch (RuntimeException | OutOfMemoryError e) {
             Log.e("TrueHue", "Saving DNG after JPEG development failed", e);
             PhotoStore.saveDng(getApplicationContext(), image, sensor, shot, stamp, angle);
-            main.post(() -> actionFailed(session, "JPEG 显影失败，已保留 DNG 底片"));
+            main.post(() -> actionFailed(session, "原彩合成失败，已保存原始底片"));
             return;
         }
         Uri saved;
@@ -907,10 +1002,10 @@ public final class MainActivity extends Activity implements SensorEventListener 
         if (saveNegative) {
             try {
                 PhotoStore.saveDng(getApplicationContext(), image, sensor, shot, stamp, angle);
-                message = "JPEG 和 DNG 已保存";
+                message = "照片与底片已保存";
             } catch (IOException | RuntimeException e) {
                 Log.e("TrueHue", "Optional DNG could not be saved", e);
-                message = "JPEG 已保存，DNG 写入失败";
+                message = "照片已保存，底片写入失败";
             }
         }
         if (compare) {
@@ -922,10 +1017,10 @@ public final class MainActivity extends Activity implements SensorEventListener 
                 } finally {
                     baseline.recycle();
                 }
-                message += " · 已存基线对照";
+                message += " · 已存对照图";
             } catch (IOException | RuntimeException | OutOfMemoryError e) {
                 Log.w("TrueHue", "Cannot save baseline companion", e);
-                message += " · 基线对照保存失败";
+                message += " · 对照图保存失败";
             }
         }
         photoSaved(saved, message, stamp, session);
@@ -936,7 +1031,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
             try {
                 Uri saved = PhotoStore.save(getApplicationContext(), image, timestamp, null,
                         Float.NaN, false, false, selected, currentLensMm);
-                photoSaved(saved, "同取景照片已保存", timestamp, session);
+                photoSaved(saved, "快拍照片已保存", timestamp, session);
             } catch (IOException | RuntimeException e) {
                 Log.e("TrueHue", "Cannot save preview capture", e);
                 main.post(() -> actionFailed(session, "照片保存失败，请检查可用空间后重试"));
@@ -957,6 +1052,8 @@ public final class MainActivity extends Activity implements SensorEventListener 
             }
             if (session != run) return;
             busy = false;
+            main.removeCallbacks(clearStatus);
+            showingTransientStatus = false;
             ui.status.setText(message);
             refreshControls();
             scheduleProof();
@@ -1028,6 +1125,9 @@ public final class MainActivity extends Activity implements SensorEventListener 
         content.setOrientation(LinearLayout.VERTICAL);
         content.setBackgroundColor(CameraScreen.BG);
         Dialog dialog = CameraPanels.photo(ui, content);
+        if (dialog.getWindow() != null) {
+            dialog.getWindow().setColorMode(ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT);
+        }
 
         LinearLayout header = new LinearLayout(this);
         header.setGravity(Gravity.CENTER_VERTICAL);
@@ -1050,7 +1150,8 @@ public final class MainActivity extends Activity implements SensorEventListener 
             mp.setMarginEnd(ui.dp(6));
             header.addView(modePill, mp);
             if (meta.ultraHdr) {
-                TextView hdrPill = ui.label("ProXDR", 11, CameraScreen.ACCENT);
+                TextView hdrPill = ui.label("亮彩", 11, CameraScreen.ACCENT);
+                hdrPill.setContentDescription("高光亮彩照片");
                 hdrPill.setPadding(ui.dp(8), ui.dp(3), ui.dp(8), ui.dp(3));
                 hdrPill.setBackground(ui.rounded(0x26e8a838, 10, CameraScreen.ACCENT));
                 LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(-2, -2);
@@ -1077,8 +1178,11 @@ public final class MainActivity extends Activity implements SensorEventListener 
         footer.setPadding(ui.dp(16), ui.dp(10), ui.dp(16), ui.dp(18));
         content.addView(footer, new LinearLayout.LayoutParams(-1, -2));
 
-        if (meta != null && !meta.summary.isEmpty()) {
-            TextView exifBar = ui.label(meta.summary + " · " + meta.look, 12, CameraScreen.MUTED);
+        if (meta != null) {
+            String barText = showProInfo && !meta.summary.isEmpty()
+                    ? meta.summary + " · " + meta.look
+                    : "风格：" + meta.look + " · 双指缩放可看细节";
+            TextView exifBar = ui.label(barText, 12, CameraScreen.MUTED);
             exifBar.setFontFeatureSettings("tnum");
             exifBar.setGravity(Gravity.CENTER);
             exifBar.setPadding(0, 0, 0, ui.dp(10));

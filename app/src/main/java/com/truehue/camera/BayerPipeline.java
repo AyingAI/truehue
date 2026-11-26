@@ -10,13 +10,45 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 /**
- * Develops a 16-bit Bayer plane into sRGB (and optional Ultra HDR gainmap).
+ * Develops a 16-bit Bayer plane into sRGB or Display P3 with an optional Ultra HDR gainmap.
  * Supports both the legacy 0.5.1 streaming path and the multi-threaded TrueHue 2.0 optical engine.
  */
 final class BayerPipeline {
     private static final int STRIP_HEIGHT = 32;
     private static final int TONE_RESOLUTION = 2048;
     private static final int FILMIC_MAX = 8;
+    private static final float LUM_R_SRGB = 0.2126f, LUM_G_SRGB = 0.7152f, LUM_B_SRGB = 0.0722f;
+    private static final float LUM_R_P3 = 0.2290036f, LUM_G_P3 = 0.6917267f, LUM_B_P3 = 0.0792697f;
+    private static final float[] SRGB_TO_LMS = {
+            0.4122215f, 0.5363325f, 0.0514460f,
+            0.2119035f, 0.6806995f, 0.1073970f,
+            0.0883025f, 0.2817188f, 0.6299787f
+    };
+    private static final float[] LMS_TO_SRGB = {
+            4.0767417f, -3.3077116f, 0.2309699f,
+            -1.2684380f, 2.6097574f, -0.3413194f,
+            -0.0041961f, -0.7034186f, 1.7076147f
+    };
+    private static final float[] P3_TO_LMS = {
+            0.4813598f, 0.4621372f, 0.0565030f,
+            0.2288185f, 0.6532276f, 0.1179539f,
+            0.0839359f, 0.2241595f, 0.6919046f
+    };
+    private static final float[] LMS_TO_P3 = {
+            3.1279112f, -2.2572933f, 0.1293820f,
+            -1.0909778f, 2.4132971f, -0.3223194f,
+            -0.0260023f, -0.5080115f, 1.5340138f
+    };
+    private static final float[] LMS_TO_LAB = {
+            0.2104543f, 0.7936178f, -0.0040720f,
+            1.9779985f, -2.4285922f, 0.4505937f,
+            0.0259040f, 0.7827718f, -0.8086758f
+    };
+    private static final float[] LAB_TO_LMS = {
+            1.0000000f, 0.3963378f, 0.2158038f,
+            1.0000000f, -0.1055613f, -0.0638542f,
+            1.0000001f, -0.0894842f, -1.2914855f
+    };
     private static final float[] TONE_GAIN = buildToneGain(false);
     private static final float[] SOFT_GAIN = buildToneGain(true);
     private static final float[] OPTICAL_FILMIC = buildOpticalFilmic();
@@ -35,8 +67,10 @@ final class BayerPipeline {
 
     static final class Options {
         boolean natural = true;
+        boolean wideGamut = false;
         float equivalentMm = 0f;
         int iso = 0;
+        float sceneEv = Float.NaN;
         float noiseSlope = 0f;
         float noiseOffset = 0f;
         float effectiveFrames = 1f;
@@ -328,24 +362,26 @@ final class BayerPipeline {
         float[] yPlane = new float[n];
         float[] crPlane = new float[n];
         float[] cbPlane = new float[n];
+        boolean wideGamut = opt.wideGamut;
 
         // Stage A: Parallel Bayer normalization, shading, hot-pixel guard, directional demosaic, CCM.
-        demosaicParallel(yPlane, crPlane, cbPlane);
+        demosaicParallel(yPlane, crPlane, cbPlane, wideGamut);
 
-        // Stage B: Noise-profile-guided fast chroma denoising + gentle flat-area luma cleanup.
+        // Stage B: Noise-calibrated joint bilateral chroma denoising + gentle flat-area luma cleanup.
         float effSlope = (opt.noiseSlope > 0 ? opt.noiseSlope : opt.iso * 6.5e-7f)
                 / Math.max(1f, opt.effectiveFrames);
         float effOffset = (opt.noiseOffset > 0 ? opt.noiseOffset : 1e-6f)
                 / Math.max(1f, opt.effectiveFrames);
         if (width >= 32 && height >= 32 && (opt.noiseSlope > 0 || opt.iso >= 150)) {
-            denoiseChromaGuided(yPlane, crPlane, cbPlane, effSlope);
-            if (effSlope > 9e-5f) {
+            denoiseChromaBilateral(yPlane, crPlane, cbPlane, effSlope, effOffset);
+            if (effSlope > 1.2e-4f) {
                 denoiseAndClarityLuma(yPlane, effSlope, effOffset);
             }
         }
 
-        // Stage C: Physically-grounded scene exposure placement (preserving manual EV & low-key night).
-        float exposure = computeSceneExposure(yPlane, opt.userEvBias);
+        // Stage C: Physically-grounded scene exposure placement + veiling-glare black-point anchor.
+        SceneStats sceneStats = computeSceneExposure(yPlane, opt);
+        float exposure = sceneStats.exposure;
 
         // Stage D: 1/4-res guided log-luminance light & shadow sculpting (zero halo).
         float[] baseGrid = null;
@@ -360,17 +396,19 @@ final class BayerPipeline {
             baseDr = bPct[1] - bPct[0];
             boolean ultra = opt.equivalentMm > 0 && opt.equivalentMm < 20;
             boolean tele = opt.equivalentMm >= 45;
-            float noisy = opt.iso <= 0 ? 0.35f : smoothStep((opt.iso - 220f) / (ultra ? 600f : 1300f));
+            float noisy = opt.iso <= 0 ? 0.35f
+                    : smoothStep((opt.iso - (tele ? 180f : 220f)) / (ultra ? 600f : tele ? 750f : 1300f));
             float drGate = smoothStep((baseDr - 4.4f) / 2.0f);
-            shadowBoost = (ultra ? 0.14f : tele ? 0.34f : 0.26f) * drGate * (1f - (ultra ? 0.9f : 0.65f) * noisy);
+            shadowBoost = (ultra ? 0.14f : tele ? 0.24f : 0.22f)
+                    * drGate * (1f - (ultra ? 0.90f : tele ? 0.80f : 0.65f) * noisy);
         }
 
-        // Stage E: Optical filmic S-curve + path-to-white + vibrance + filter + optional Ultra HDR gainmap.
+        // Stage E: OkLab filmic S-curve + perceptual chroma recovery + soft gamut clamp + Ultra HDR gainmap.
         return encodeFinalParallel(rot, opt, writer, yPlane, crPlane, cbPlane,
-                exposure, baseGrid, baseW, baseH, shadowBoost);
+                sceneStats, effSlope, baseGrid, baseW, baseH, shadowBoost);
     }
 
-    private void demosaicParallel(float[] yOut, float[] crOut, float[] cbOut) {
+    private void demosaicParallel(float[] yOut, float[] crOut, float[] cbOut, boolean wideGamut) {
         int workers = width * height >= 262_144 ? 6 : 1;
         runStrips(height, workers, (yStart, yEnd) -> {
             ShortBuffer src = raw.duplicate();
@@ -389,7 +427,7 @@ final class BayerPipeline {
                 int sy = next < height ? next : 2 * height - 2 - next;
                 loadFrom(src, sRow, blend, sy, lines[4], clip[4]);
 
-                demosaicRow(y, lines, clip, yOut, crOut, cbOut);
+                demosaicRow(y, lines, clip, yOut, crOut, cbOut, wideGamut);
 
                 float[] reuse = lines[0];
                 System.arraycopy(lines, 1, lines, 0, 4);
@@ -402,7 +440,7 @@ final class BayerPipeline {
     }
 
     private void demosaicRow(int y, float[][] lines, byte[][] clip,
-                             float[] yOut, float[] crOut, float[] cbOut) {
+                             float[] yOut, float[] crOut, float[] cbOut, boolean wideGamut) {
         float[] up2 = lines[0], up = lines[1], row = lines[2], down = lines[3], down2 = lines[4];
         int phase = (y & 1) << 1;
         boolean redOnRow = channel[phase] == 0 || channel[phase + 1] == 0;
@@ -489,7 +527,7 @@ final class BayerPipeline {
                 b = redOnRow ? vertical : horizontal;
             }
 
-            writeLinearPixel(rowOff + x, i, r, g, b, clip, yOut, crOut, cbOut);
+            writeLinearPixel(rowOff + x, i, r, g, b, clip, yOut, crOut, cbOut, wideGamut);
         }
     }
 
@@ -509,7 +547,7 @@ final class BayerPipeline {
     }
 
     private void writeLinearPixel(int idx, int i, float r, float g, float b, byte[][] clip,
-                                  float[] yOut, float[] crOut, float[] cbOut) {
+                                  float[] yOut, float[] crOut, float[] cbOut, boolean wideGamut) {
         float red = matrix[0] * r + matrix[1] * g + matrix[2] * b;
         float green = matrix[3] * r + matrix[4] * g + matrix[5] * b;
         float blue = matrix[6] * r + matrix[7] * g + matrix[8] * b;
@@ -528,7 +566,10 @@ final class BayerPipeline {
             blue += amount * (wMax - blue);
         }
 
-        float lum = 0.2126f * red + 0.7152f * green + 0.0722f * blue;
+        float lumR = wideGamut ? LUM_R_P3 : LUM_R_SRGB;
+        float lumG = wideGamut ? LUM_G_P3 : LUM_G_SRGB;
+        float lumB = wideGamut ? LUM_B_P3 : LUM_B_SRGB;
+        float lum = lumR * red + lumG * green + lumB * blue;
         float mn = Math.min(red, Math.min(green, blue));
         if (mn < 0f) {
             if (lum <= 0f) {
@@ -545,110 +586,161 @@ final class BayerPipeline {
         cbOut[idx] = blue - lum;
     }
 
-    private void denoiseChromaGuided(float[] yPlane, float[] crPlane, float[] cbPlane, float noiseSlope) {
+    private void denoiseChromaBilateral(float[] yPlane, float[] crPlane, float[] cbPlane,
+                                        float effSlope, float effOffset) {
         int hw = width / 2, hh = height / 2;
         if (hw < 8 || hh < 8) return;
 
-        // Compute log-Y range cleanly on subsampled grid.
-        float minL = Float.MAX_VALUE, maxL = -Float.MAX_VALUE;
-        for (int hy = 0; hy < hh; hy += 4) {
-            int r0 = (hy * 2) * width;
-            for (int hx = 0; hx < hw; hx += 4) {
-                float v = (float) Math.log(Math.max(yPlane[r0 + hx * 2], 1e-4f) + 0.01f);
-                if (v < minL) minL = v;
-                if (v > maxL) maxL = v;
-            }
-        }
-        float invSpan = 1f / Math.max(1e-3f, maxL - minL);
-        final float logMin = minL;
-
-        int targetRadius = noiseSlope > 4.5e-4f ? 4 : (noiseSlope > 1.5e-4f ? 3 : 2);
+        int targetRadius = effSlope > 9e-4f ? 3 : 2;
         int radius = Math.min(targetRadius, Math.min(hw, hh) / 4);
-        float eps = Math.max(0.0015f, Math.min(0.020f, 0.0015f + 2.6f * noiseSlope));
-        // Two box filters and bilinear upsampling need this many original half-resolution rows.
-        int halo = 2 * radius + 1;
+        int halo = radius + 1;
         int bandRows = 64;
         int capacity = Math.min(hh, bandRows + 2 * halo) * hw;
-        float[] guide = new float[capacity], red = new float[capacity], blue = new float[capacity];
-        float[] mean = new float[capacity], variance = new float[capacity], tmp = new float[capacity];
-        float[] aRed = new float[capacity], bRed = new float[capacity];
-        float[] aBlue = new float[capacity], bBlue = new float[capacity];
+        float[] yH = new float[capacity], logYH = new float[capacity];
+        float[] crH = new float[capacity], cbH = new float[capacity];
+        float[] tmpCr = new float[capacity], tmpCb = new float[capacity];
+        float[] outCr = new float[capacity], outCb = new float[capacity];
+
+        final float invLVar = 1f / 0.14f;
         int previousTop = 0, prepared = 0;
         for (int first = 0; first < hh; first += bandRows) {
             int end = Math.min(hh, first + bandRows);
             int top = Math.max(0, first - halo), bottom = Math.min(hh, end + halo);
             int rows = bottom - top;
-            // Retain original samples across the boundary before modifying the full-resolution planes.
             int keep = (prepared - top) * hw, offset = (top - previousTop) * hw;
-            System.arraycopy(guide, offset, guide, 0, keep);
-            System.arraycopy(red, offset, red, 0, keep);
-            System.arraycopy(blue, offset, blue, 0, keep);
+            if (keep > 0) {
+                System.arraycopy(yH, offset, yH, 0, keep);
+                System.arraycopy(logYH, offset, logYH, 0, keep);
+                System.arraycopy(crH, offset, crH, 0, keep);
+                System.arraycopy(cbH, offset, cbH, 0, keep);
+            }
             for (int hy = prepared; hy < bottom; hy++) {
                 int upper = 2 * hy * width, lower = upper + width;
                 for (int hx = 0; hx < hw; hx++) {
                     int x = hx * 2, i = (hy - top) * hw + hx;
-                    float avg = quadMean(yPlane, upper + x, lower + x);
-                    guide[i] = logGuide(avg, logMin, invSpan);
-                    red[i] = quadMean(crPlane, upper + x, lower + x);
-                    blue[i] = quadMean(cbPlane, upper + x, lower + x);
+                    float yAvg = quadMean(yPlane, upper + x, lower + x);
+                    yH[i] = yAvg;
+                    logYH[i] = log2f(Math.max(0f, yAvg) + 0.005f);
+                    crH[i] = quadMean(crPlane, upper + x, lower + x);
+                    cbH[i] = quadMean(cbPlane, upper + x, lower + x);
                 }
             }
             previousTop = top;
             prepared = bottom;
 
-            int cells = rows * hw;
-            boxFilter(guide, hw, rows, radius, tmp, mean);
-            for (int i = 0; i < cells; i++) variance[i] = guide[i] * guide[i];
-            boxFilter(variance, hw, rows, radius, tmp, variance);
-            for (int i = 0; i < cells; i++) variance[i] = Math.max(0f, variance[i] - mean[i] * mean[i]);
-            solveGuidedCoeffs(guide, mean, variance, red, hw, rows, radius, eps, tmp, aRed, bRed);
-            solveGuidedCoeffs(guide, mean, variance, blue, hw, rows, radius, eps, tmp, aBlue, bBlue);
+            // Pass 1: Horizontal joint bilateral filter (local EV luma + noise-calibrated chroma edge-stop).
+            runStrips(rows, hw * rows >= 65_536 ? 6 : 1, (r0, r1) -> {
+                for (int r = r0; r < r1; r++) {
+                    int rowOff = r * hw;
+                    for (int x = 0; x < hw; x++) {
+                        int cIdx = rowOff + x;
+                        float yC = yH[cIdx];
+                        float logC = logYH[cIdx];
+                        float crC = crH[cIdx];
+                        float cbC = cbH[cIdx];
+                        float nVar = effSlope * Math.max(0.008f, yC) + effOffset;
+                        float invCVar = 1f / Math.max(0.00028f, 12.0f * nVar);
+                        float sumW = 0f, sumCr = 0f, sumCb = 0f;
+                        for (int dx = -radius; dx <= radius; dx++) {
+                            int nx = Math.max(0, Math.min(hw - 1, x + dx));
+                            int nIdx = rowOff + nx;
+                            float wS = 1f / (1f + 0.35f * dx * dx);
+                            float dL = logYH[nIdx] - logC;
+                            float wL = 1f / (1f + dL * dL * invLVar);
+                            float dCr = crH[nIdx] - crC;
+                            float dCb = cbH[nIdx] - cbC;
+                            float cRatio = (dCr * dCr + dCb * dCb) * invCVar;
+                            float wC = 1f / (1f + cRatio * (1f + 0.5f * cRatio));
+                            float w = wS * wL * wC;
+                            sumW += w;
+                            sumCr += w * crH[nIdx];
+                            sumCb += w * cbH[nIdx];
+                        }
+                        float invW = 1f / sumW;
+                        tmpCr[cIdx] = sumCr * invW;
+                        tmpCb[cIdx] = sumCb * invW;
+                    }
+                }
+            });
 
+            // Pass 2: Vertical joint bilateral filter covering all rows needed by upsampling [first-1..end].
+            int vStart = Math.max(0, first - 1);
+            int vEnd = Math.min(hh, end + 1);
+            int vCount = vEnd - vStart;
+            runStrips(vCount, hw * vCount >= 65_536 ? 6 : 1, (v0, v1) -> {
+                for (int v = v0; v < v1; v++) {
+                    int hy = vStart + v;
+                    int cRow = hy - top;
+                    int cRowOff = cRow * hw;
+                    for (int x = 0; x < hw; x++) {
+                        int cIdx = cRowOff + x;
+                        float yC = yH[cIdx];
+                        float logC = logYH[cIdx];
+                        float crC = tmpCr[cIdx];
+                        float cbC = tmpCb[cIdx];
+                        float nVar = effSlope * Math.max(0.008f, yC) + effOffset;
+                        float invCVar = 1f / Math.max(0.00024f, 9.0f * nVar);
+                        float sumW = 0f, sumCr = 0f, sumCb = 0f;
+                        for (int dy = -radius; dy <= radius; dy++) {
+                            int ny = Math.max(0, Math.min(hh - 1, hy + dy));
+                            int nIdx = (ny - top) * hw + x;
+                            float wS = 1f / (1f + 0.35f * dy * dy);
+                            float dL = logYH[nIdx] - logC;
+                            float wL = 1f / (1f + dL * dL * invLVar);
+                            float dCr = tmpCr[nIdx] - crC;
+                            float dCb = tmpCb[nIdx] - cbC;
+                            float cRatio = (dCr * dCr + dCb * dCb) * invCVar;
+                            float wC = 1f / (1f + cRatio * (1f + 0.5f * cRatio));
+                            float w = wS * wL * wC;
+                            sumW += w;
+                            sumCr += w * tmpCr[nIdx];
+                            sumCb += w * tmpCb[nIdx];
+                        }
+                        float invW = 1f / sumW;
+                        outCr[cIdx] = sumCr * invW;
+                        outCb[cIdx] = sumCb * invW;
+                    }
+                }
+            });
+
+            // Joint bilateral upsampling back to full-res luminance edges.
             final int startY = 2 * first;
             int outputRows = (end == hh ? height : 2 * end) - startY;
-            runStrips(outputRows, width * outputRows >= 262144 ? 6 : 1, (from, to) -> {
+            runStrips(outputRows, width * outputRows >= 262_144 ? 6 : 1, (from, to) -> {
                 for (int y = startY + from; y < startY + to; y++) {
                     float fy = Math.max(0f, Math.min(hh - 1f, y * 0.5f - 0.25f));
-                    int iy = (int) fy;
-                    int r0 = (iy - top) * hw, r1 = (Math.min(hh - 1, iy + 1) - top) * hw;
-                    float ty = fy - iy;
+                    int iy0 = (int) fy, iy1 = Math.min(hh - 1, iy0 + 1);
+                    float ty = fy - iy0, uy = 1f - ty;
+                    int r0 = (iy0 - top) * hw, r1 = (iy1 - top) * hw;
                     for (int x = 0; x < width; x++) {
                         float fx = Math.max(0f, Math.min(hw - 1f, x * 0.5f - 0.25f));
                         int x0 = (int) fx, x1 = Math.min(hw - 1, x0 + 1);
-                        float tx = fx - x0;
+                        float tx = fx - x0, ux = 1f - tx;
                         int i = y * width + x;
-                        float g = logGuide(yPlane[i], logMin, invSpan);
-                        crPlane[i] = bilerp(aRed, r0, r1, x0, x1, tx, ty) * g
-                                + bilerp(bRed, r0, r1, x0, x1, tx, ty);
-                        cbPlane[i] = bilerp(aBlue, r0, r1, x0, x1, tx, ty) * g
-                                + bilerp(bBlue, r0, r1, x0, x1, tx, ty);
+                        float logY = log2f(Math.max(0f, yPlane[i]) + 0.005f);
+
+                        int i00 = r0 + x0, i01 = r0 + x1, i10 = r1 + x0, i11 = r1 + x1;
+                        float d00 = logY - logYH[i00];
+                        float d01 = logY - logYH[i01];
+                        float d10 = logY - logYH[i10];
+                        float d11 = logY - logYH[i11];
+                        float w00 = (ux * uy) / (1f + 10f * d00 * d00);
+                        float w01 = (tx * uy) / (1f + 10f * d01 * d01);
+                        float w10 = (ux * ty) / (1f + 10f * d10 * d10);
+                        float w11 = (tx * ty) / (1f + 10f * d11 * d11);
+                        float invSum = 1f / (w00 + w01 + w10 + w11);
+                        crPlane[i] = (w00 * outCr[i00] + w01 * outCr[i01]
+                                + w10 * outCr[i10] + w11 * outCr[i11]) * invSum;
+                        cbPlane[i] = (w00 * outCb[i00] + w01 * outCb[i01]
+                                + w10 * outCb[i10] + w11 * outCb[i11]) * invSum;
                     }
                 }
             });
         }
     }
 
-    private static float logGuide(float value, float min, float invSpan) {
-        float normalized = ((float) Math.log(Math.max(value, 1e-4f) + 0.01f) - min) * invSpan;
-        return Math.max(0f, Math.min(1f, normalized));
-    }
-
     private static float quadMean(float[] plane, int upper, int lower) {
         return 0.25f * (plane[upper] + plane[upper + 1] + plane[lower] + plane[lower + 1]);
-    }
-
-    private static void solveGuidedCoeffs(float[] guide, float[] mean, float[] variance, float[] chroma,
-                                          int w, int h, int radius, float eps, float[] tmp, float[] a, float[] b) {
-        int n = w * h;
-        boxFilter(chroma, w, h, radius, tmp, b);
-        for (int i = 0; i < n; i++) a[i] = guide[i] * chroma[i];
-        boxFilter(a, w, h, radius, tmp, a);
-        for (int i = 0; i < n; i++) {
-            a[i] = (a[i] - mean[i] * b[i]) / (variance[i] + eps);
-            b[i] -= a[i] * mean[i];
-        }
-        boxFilter(a, w, h, radius, tmp, a);
-        boxFilter(b, w, h, radius, tmp, b);
     }
 
     private void denoiseAndClarityLuma(float[] yPlane, float noiseSlope, float noiseOffset) {
@@ -723,8 +815,18 @@ final class BayerPipeline {
         invokeJobs(jobs);
     }
 
-    private float computeSceneExposure(float[] yPlane, float userEvBias) {
-        if (Math.abs(userEvBias) >= 0.05f) return 1f;
+    private static final class SceneStats {
+        final float exposure, blackVeil, p50, p92;
+
+        SceneStats(float exposure, float blackVeil, float p50, float p92) {
+            this.exposure = exposure;
+            this.blackVeil = blackVeil;
+            this.p50 = p50;
+            this.p92 = p92;
+        }
+    }
+
+    private SceneStats computeSceneExposure(float[] yPlane, Options opt) {
         int step = Math.max(1, Math.min(width, height) / 96);
         int[] hist = new int[513];
         int count = 0;
@@ -737,21 +839,33 @@ final class BayerPipeline {
                 count++;
             }
         }
-        if (count == 0) return 1f;
+        if (count == 0) return new SceneStats(1f, 0f, 0.18f, 0.5f);
+        float p005 = histPercentile(hist, count, 0.005f, 512f);
         float p10 = histPercentile(hist, count, 0.10f, 512f);
         float p50 = histPercentile(hist, count, 0.50f, 512f);
         float p92 = histPercentile(hist, count, 0.92f, 512f);
         float p995 = histPercentile(hist, count, 0.995f, 512f);
 
-        if (p92 - p10 <= 0.035f || p92 <= 0.06f) return 1f;
-        float gainKey = 0.145f / Math.max(p50, 0.020f);
-        float gainWhite = 0.78f / Math.max(p92, 0.075f);
-        float gainHi = 1.95f / Math.max(p995, 0.22f);
-        float nightGate = smoothStep((p92 - 0.06f) / 0.10f);
-        float blended = 0.45f * Math.max(gainKey, 1f) + 0.55f * Math.max(gainWhite, 1f);
-        float rawGain = Math.max(1f, Math.min(Math.min(3.5f, Math.max(1.65f, gainHi)),
-                Math.min(gainWhite, blended)));
-        return 1f + nightGate * (rawGain - 1f);
+        float exposure = 1f;
+        if (Math.abs(opt.userEvBias) < 0.05f && p92 - p10 > 0.035f && p92 > 0.06f) {
+            float gainKey = 0.145f / Math.max(p50, 0.020f);
+            float gainWhite = 0.78f / Math.max(p92, 0.075f);
+            float gainHi = 1.95f / Math.max(p995, 0.22f);
+            float nightGate = smoothStep((p92 - 0.06f) / 0.10f);
+            float blended = 0.45f * Math.max(gainKey, 1f) + 0.55f * Math.max(gainWhite, 1f);
+            float rawGain = Math.max(1f, Math.min(Math.min(3.5f, Math.max(1.65f, gainHi)),
+                    Math.min(gainWhite, blended)));
+            exposure = 1f + nightGate * (rawGain - 1f);
+        }
+
+        float blackVeil = 0f;
+        if (p92 - p10 > 0.08f && p92 > 0.14f && p005 > 0.003f) {
+            float maxVeil = (opt.equivalentMm >= 45f) ? 0.014f
+                    : (opt.equivalentMm > 0f && opt.equivalentMm < 20f) ? 0.010f : 0.008f;
+            float drWeight = smoothStep((p92 - p005 - 0.12f) / 0.28f);
+            blackVeil = Math.min(maxVeil, Math.max(0f, (p005 - 0.002f) * 0.55f)) * drWeight;
+        }
+        return new SceneStats(exposure, blackVeil, p50, p92);
     }
 
     private float[] buildIlluminationBase(float[] yPlane, float exposure, int bw, int bh) {
@@ -801,7 +915,8 @@ final class BayerPipeline {
 
     private GainmapData encodeFinalParallel(int rotation, Options opt, StripWriter writer,
                                             float[] yPlane, float[] crPlane, float[] cbPlane,
-                                            float exposure, float[] baseGrid, int baseW, int baseH,
+                                            SceneStats sceneStats, float effSlope,
+                                            float[] baseGrid, int baseW, int baseH,
                                             float shadowBoost) {
         boolean swap = rotation % 180 != 0;
         int outW = swap ? height : width;
@@ -813,12 +928,30 @@ final class BayerPipeline {
         byte[] gainPixels = opt.buildGainmap ? new byte[gw * gh] : null;
         PhotoFilter filter = opt.filter;
 
+        final boolean wideGamut = opt.wideGamut;
+        final float lumR = wideGamut ? LUM_R_P3 : LUM_R_SRGB;
+        final float lumG = wideGamut ? LUM_G_P3 : LUM_G_SRGB;
+        final float lumB = wideGamut ? LUM_B_P3 : LUM_B_SRGB;
+        final float[] toLms = wideGamut ? P3_TO_LMS : SRGB_TO_LMS;
+        final float[] fromLms = wideGamut ? LMS_TO_P3 : LMS_TO_SRGB;
+
+        final float exposure = sceneStats.exposure;
+        final float blackVeil = sceneStats.blackVeil;
+        float rawDim = Float.isFinite(opt.sceneEv)
+                ? smoothStep((7.5f - opt.sceneEv) / 3.5f)
+                : smoothStep((0.25f - sceneStats.p50) / 0.18f);
+        final float dimBoost = rawDim * (1f - 0.55f * smoothStep((effSlope - 4e-4f) / 1.2e-3f));
+        final float teleBoost = opt.equivalentMm >= 45f ? 0.05f : 0f;
+
         int stripRows = Math.min(height, STRIP_HEIGHT);
         int stripCount = (height + stripRows - 1) / stripRows;
         int workers = width * height >= 262_144 ? Math.min(6, stripCount) : 1;
 
         runStrips(stripCount, workers, (s0, s1) -> {
             int[] pixels = new int[width * stripRows];
+            float[] labL = new float[3];
+            float[] labC = new float[3];
+            float[] rgbOut = new float[3];
             for (int s = s0; s < s1; s++) {
                 int y0 = s * stripRows;
                 int count = Math.min(stripRows, height - y0);
@@ -843,6 +976,12 @@ final class BayerPipeline {
                         float lum = yPlane[idx] * exposure;
                         float cr = crPlane[idx] * exposure;
                         float cb = cbPlane[idx] * exposure;
+
+                        if (blackVeil > 1e-5f && lum > 0f) {
+                            float veilExp = blackVeil * exposure;
+                            float veilSub = veilExp * smoothStep(lum / (3.0f * veilExp));
+                            lum = Math.max(0f, lum - veilSub);
+                        }
 
                         if (baseGrid != null && lum > 1e-5f) {
                             float fx = Math.max(0f, Math.min(baseW - 1f, x * 0.25f - 0.375f));
@@ -873,7 +1012,7 @@ final class BayerPipeline {
                         // Reconstruct linear RGB with gamut protection.
                         float r = lum + cr;
                         float b = lum + cb;
-                        float g = (lum - 0.2126f * r - 0.0722f * b) / 0.7152f;
+                        float g = (lum - lumR * r - lumB * b) / lumG;
                         float mn = Math.min(r, Math.min(g, b));
                         if (mn < 0f) {
                             if (lum <= 0f) {
@@ -887,46 +1026,64 @@ final class BayerPipeline {
                         }
 
                         float peakHdr = Math.max(r, Math.max(g, b));
-                        float lumMapped = opticalFilmic(lum);
-                        float tmScale = lum > 1e-6f ? lumMapped / lum : 0f;
-                        r *= tmScale;
-                        g *= tmScale;
-                        b *= tmScale;
+                        if (Math.max(Math.abs(r - g), Math.abs(g - b)) < 1e-6f) {
+                            float mapped = Math.max(0f, Math.min(1f, opticalFilmic(lum)));
+                            r = g = b = mapped;
+                        } else {
+                            float lumMapped = opticalFilmic(lum);
+                            float tmScale = lum > 1e-6f ? lumMapped / lum : 0f;
+                            rgbToOklab(r * tmScale, g * tmScale, b * tmScale, toLms, labL);
+                            rgbToOklab(opticalFilmic(r), opticalFilmic(g), opticalFilmic(b), toLms, labC);
 
-                        // Hue-preserving highlight path-to-white.
-                        float pAfter = Math.max(r, Math.max(g, b));
-                        if (pAfter > 0.78f) {
-                            float desat = 0.90f * smoothStep((pAfter - 0.78f) / 0.85f);
-                            float targetW = Math.min(0.996f, opticalFilmic(peakHdr));
-                            r += desat * (targetW - r);
-                            g += desat * (targetW - g);
-                            b += desat * (targetW - b);
-                        }
-                        float pSafe = Math.max(1f, Math.max(r, Math.max(g, b)));
-                        if (pSafe > 1f) {
-                            r /= pSafe; g /= pSafe; b /= pSafe;
-                        }
+                            float lTarget = Math.max(0f, Math.min(0.9999f, labL[0]));
+                            float aL = labL[1], bL_ok = labL[2];
+                            float cL = (float) Math.hypot(aL, bL_ok);
+                            float cC = (float) Math.hypot(labC[1], labC[2]);
 
-                        // Restrained natural chromatic purity recovery (tapered on skin/neutral).
-                        float yf = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-                        float pk = Math.max(r, Math.max(g, b));
-                        float minC = Math.min(r, Math.min(g, b));
-                        if (pk > 0.025f && yf < 0.75f) {
-                            float chroma = (pk - minC) / pk;
-                            float vib = 0.11f * smoothStep((chroma - 0.05f) / 0.18f)
-                                    * (1f - smoothStep((chroma - 0.58f) / 0.32f))
-                                    * smoothStep((yf - 0.02f) / 0.07f)
-                                    * (1f - smoothStep((yf - 0.50f) / 0.25f));
-                            if (r > g && g > b) {
-                                float warm = smoothStep((r - g) / (0.20f * pk))
-                                        * smoothStep((g - b) / (0.14f * pk));
-                                vib *= (1f - 0.45f * warm);
+                            // Narrow skin-tone protection in OkLab (hue ~25-65 deg, moderate chroma).
+                            float skin = 0f;
+                            if (aL > 0f && bL_ok > 0f && cL > 0.025f) {
+                                float tanH = bL_ok / (aL + 1e-6f);
+                                skin = smoothStep((tanH - 0.40f) / 0.25f)
+                                        * (1f - smoothStep((tanH - 1.55f) / 0.65f))
+                                        * smoothStep((cL - 0.025f) / 0.025f)
+                                        * (1f - smoothStep((cL - 0.12f) / 0.06f));
                             }
-                            if (vib > 0f) {
-                                r = Math.max(0f, Math.min(1f, yf + (r - yf) * (1f + vib)));
-                                g = Math.max(0f, Math.min(1f, yf + (g - yf) * (1f + vib)));
-                                b = Math.max(0f, Math.min(1f, yf + (b - yf) * (1f + vib)));
+
+                            float beta = 0.60f * (1f - 0.35f * skin);
+                            float cTarget = cL + beta * (cC - cL);
+
+                            float lGate = smoothStep((lTarget - 0.10f) / 0.14f)
+                                    * (1f - smoothStep((lTarget - 0.72f) / 0.20f));
+                            float cGate = smoothStep((cL - 0.012f) / 0.030f)
+                                    * (1f - smoothStep((cL - 0.16f) / 0.12f));
+                            float boost = (0.12f + 0.06f * dimBoost + teleBoost)
+                                    * lGate * cGate * (1f - 0.35f * skin);
+                            cTarget = Math.max(0f, cTarget * (1f + boost));
+
+                            float scaleC = cL > 1e-6f ? cTarget / cL : 0f;
+                            float aT = aL * scaleC;
+                            float bT = bL_ok * scaleC;
+
+                            oklabToRgb(lTarget, aT, bT, fromLms, rgbOut);
+                            if (rgbOut[0] < 0f || rgbOut[1] < 0f || rgbOut[2] < 0f
+                                    || rgbOut[0] > 1f || rgbOut[1] > 1f || rgbOut[2] > 1f) {
+                                float lo = 0f, hi = 1f;
+                                for (int it = 0; it < 5; it++) {
+                                    float mid = 0.5f * (lo + hi);
+                                    oklabToRgb(lTarget, aT * mid, bT * mid, fromLms, rgbOut);
+                                    if (rgbOut[0] >= 0f && rgbOut[1] >= 0f && rgbOut[2] >= 0f
+                                            && rgbOut[0] <= 1f && rgbOut[1] <= 1f && rgbOut[2] <= 1f) {
+                                        lo = mid;
+                                    } else {
+                                        hi = mid;
+                                    }
+                                }
+                                oklabToRgb(lTarget, aT * lo, bT * lo, fromLms, rgbOut);
                             }
+                            r = Math.max(0f, Math.min(1f, rgbOut[0]));
+                            g = Math.max(0f, Math.min(1f, rgbOut[1]));
+                            b = Math.max(0f, Math.min(1f, rgbOut[2]));
                         }
 
                         if (gainPixels != null && (x & 3) == 1 && (y & 3) == 1) {
@@ -948,7 +1105,7 @@ final class BayerPipeline {
                             }
                         }
 
-                        pixels[index] = filter.encode(r, g, b);
+                        pixels[index] = filter.encode(r, g, b, wideGamut);
                     }
                 }
                 writeRotatedStrip(writer, rotation, y0, count, pixels);
@@ -956,6 +1113,35 @@ final class BayerPipeline {
         });
 
         return gainPixels == null ? null : new GainmapData(gainPixels, gw, gh, maxGainRatio);
+    }
+
+    private static void rgbToOklab(float r, float g, float b, float[] toLms, float[] out) {
+        float l = fastCbrt(toLms[0] * r + toLms[1] * g + toLms[2] * b);
+        float m = fastCbrt(toLms[3] * r + toLms[4] * g + toLms[5] * b);
+        float s = fastCbrt(toLms[6] * r + toLms[7] * g + toLms[8] * b);
+        out[0] = LMS_TO_LAB[0] * l + LMS_TO_LAB[1] * m + LMS_TO_LAB[2] * s;
+        out[1] = LMS_TO_LAB[3] * l + LMS_TO_LAB[4] * m + LMS_TO_LAB[5] * s;
+        out[2] = LMS_TO_LAB[6] * l + LMS_TO_LAB[7] * m + LMS_TO_LAB[8] * s;
+    }
+
+    private static void oklabToRgb(float L, float a, float b, float[] fromLms, float[] out) {
+        float l_ = LAB_TO_LMS[0] * L + LAB_TO_LMS[1] * a + LAB_TO_LMS[2] * b;
+        float m_ = LAB_TO_LMS[3] * L + LAB_TO_LMS[4] * a + LAB_TO_LMS[5] * b;
+        float s_ = LAB_TO_LMS[6] * L + LAB_TO_LMS[7] * a + LAB_TO_LMS[8] * b;
+        float l = l_ * l_ * l_;
+        float m = m_ * m_ * m_;
+        float s = s_ * s_ * s_;
+        out[0] = fromLms[0] * l + fromLms[1] * m + fromLms[2] * s;
+        out[1] = fromLms[3] * l + fromLms[4] * m + fromLms[5] * s;
+        out[2] = fromLms[6] * l + fromLms[7] * m + fromLms[8] * s;
+    }
+
+    private static float fastCbrt(float x) {
+        if (x <= 0f) return 0f;
+        float y = Float.intBitsToFloat(Float.floatToRawIntBits(x) / 3 + 0x2a517d47);
+        y = (2f * y + x / (y * y)) * (1f / 3f);
+        y = (2f * y + x / (y * y)) * (1f / 3f);
+        return y;
     }
 
     private void writeRotatedStrip(StripWriter writer, int rotation, int y0, int count, int[] pixels) {

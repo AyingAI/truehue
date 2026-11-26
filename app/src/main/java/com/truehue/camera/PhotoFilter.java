@@ -3,10 +3,10 @@ package com.truehue.camera;
 /** Subtle optical color profiles in linear sRGB. Shared by live viewfinder and RAW development. */
 enum PhotoFilter {
     ORIGINAL("original", "原彩", "忠实还原肉眼所见的光影与色彩", "Original color", 0f, 0f, 0f, 0f, false),
-    MASTER("master", "光影", "深邃暗部与立体反差，大师光影质感", "Master light", .05f, -.14f, 0f, .06f, false),
+    MASTER("master", "光影", "深邃暗部与立体反差，更有电影质感", "Master light", .05f, -.14f, 0f, .06f, false),
     SOFT("soft", "柔光", "柔和亮部过渡，适合窗光与人像", "Soft light", -.11f, .04f, .09f, 0f, false),
     DETAIL("detail", "层次", "强化明暗立体感，适合建筑与木纹", "Defined tones", .045f, -.11f, 0f, .03f, false),
-    MONO("mono", "黑白", "经典光学黑白，纯粹记录光影结构", "Monochrome", .03f, -.13f, 1f, 0f, true);
+    MONO("mono", "黑白", "经典黑白胶片感，纯粹记录光影层次", "Monochrome", .03f, -.13f, 1f, 0f, true);
 
     final String id, label, description, exif;
     final float highlights, shadows, desaturation, vibrance;
@@ -49,6 +49,10 @@ enum PhotoFilter {
     }
 
     int encode(float r, float g, float b) {
+        return encode(r, g, b, false);
+    }
+
+    int encode(float r, float g, float b, boolean wideGamut) {
         if (this != ORIGINAL) {
             if (monochrome) {
                 float y = Math.max(0f, Math.min(1f, .26f * r + .64f * g + .10f * b));
@@ -61,7 +65,8 @@ enum PhotoFilter {
                 int code = gamma(m);
                 return 0xff000000 | code << 16 | code << 8 | code;
             }
-            float y = .2126f * r + .7152f * g + .0722f * b;
+            float y = wideGamut ? (0.2290036f * r + 0.6917267f * g + 0.0792697f * b)
+                    : (0.2126f * r + 0.7152f * g + 0.0722f * b);
             float light = smooth(.25f, .82f, y);
             float shade = smooth(.025f, .10f, y) * (1 - smooth(.10f, .40f, y));
             float fade = 1 - smooth(.86f, 1, y);

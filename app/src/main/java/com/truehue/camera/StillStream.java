@@ -14,6 +14,7 @@ import android.media.Image;
 import android.media.ImageReader;
 import android.os.Handler;
 import android.util.Log;
+import android.util.Range;
 import android.util.Size;
 import android.view.Surface;
 
@@ -28,11 +29,26 @@ import java.util.concurrent.Executors;
 
 /** Pairs sensor exposures (single or burst) with their metadata, keeping the reader alive during development. */
 final class StillStream {
+    static final class SafeExposure {
+        final long exposureNs;
+        final int iso;
+        final int postRawBoost;
+        final float fallbackGuardEv;
+
+        SafeExposure(long exposureNs, int iso, int postRawBoost, float fallbackGuardEv) {
+            this.exposureNs = exposureNs;
+            this.iso = iso;
+            this.postRawBoost = postRawBoost;
+            this.fallbackGuardEv = fallbackGuardEv;
+        }
+    }
+
     interface BurstCallback {
         void onProgress(int framesReceived, int totalFrames);
         void onFirstFrameForDng(Image image, CameraCharacteristics info, TotalCaptureResult result, int degrees) throws Exception;
         void onBurstReady(BurstRawMerger.Result merged, int[] channel, int width, int height,
-                          CameraCharacteristics info, TotalCaptureResult referenceResult, int degrees) throws Exception;
+                          CameraCharacteristics info, TotalCaptureResult referenceResult, int degrees,
+                          float fallbackGuardEv) throws Exception;
         void onFailure(String message);
     }
 
@@ -116,7 +132,8 @@ final class StillStream {
     }
 
     void captureBurst(CameraCaptureSession session, CameraDevice device, CaptureRequest preview,
-                      int degrees, int burstCount, boolean keepDng, BurstCallback callback) {
+                      int degrees, int burstCount, boolean keepDng,
+                      SafeExposure safeExposure, BurstCallback callback) {
         if (closed) {
             main.post(() -> callback.onFailure("镜头已关闭，拍摄已取消。"));
             return;
@@ -126,16 +143,18 @@ final class StillStream {
             return;
         }
         if (processing) {
-            waitingForReader = () -> captureBurst(session, device, preview, degrees, burstCount, keepDng, callback);
+            waitingForReader = () -> captureBurst(session, device, preview, degrees,
+                    burstCount, keepDng, safeExposure, callback);
             return;
         }
         int targetCount = Math.max(2, Math.min(burstCount, Math.max(2, maxImages - 1)));
-        Burst burst = new Burst(targetCount, degrees, keepDng, callback);
+        Burst burst = new Burst(targetCount, degrees, keepDng,
+                safeExposure == null ? Float.NaN : safeExposure.fallbackGuardEv, callback);
         activeBurst = burst;
         try {
             List<CaptureRequest> requests = new ArrayList<>(targetCount);
             for (int i = 0; i < targetCount; i++) {
-                requests.add(buildStillRequest(device, preview, true).build());
+                requests.add(buildStillRequest(device, preview, true, safeExposure).build());
             }
             worker.postDelayed(burst.overallTimeout, 12000);
             session.captureBurst(requests, new CameraCaptureSession.CaptureCallback() {
@@ -187,6 +206,12 @@ final class StillStream {
 
     private CaptureRequest.Builder buildStillRequest(CameraDevice device, CaptureRequest preview,
                                                      boolean lockExposure) throws CameraAccessException {
+        return buildStillRequest(device, preview, lockExposure, null);
+    }
+
+    private CaptureRequest.Builder buildStillRequest(CameraDevice device, CaptureRequest preview,
+                                                     boolean lockExposure, SafeExposure safeExposure)
+            throws CameraAccessException {
         CaptureRequest.Builder still = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
         still.addTarget(surface());
         copy(preview, still, CaptureRequest.CONTROL_AF_MODE);
@@ -194,7 +219,21 @@ final class StillStream {
         copy(preview, still, CaptureRequest.CONTROL_AE_REGIONS);
         copy(preview, still, CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION);
         copy(preview, still, CaptureRequest.SCALER_ROTATE_AND_CROP);
-        if (Boolean.TRUE.equals(info.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE))) {
+        if (safeExposure != null && safeExposure.exposureNs > 0L && safeExposure.iso > 0) {
+            still.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
+            still.set(CaptureRequest.SENSOR_EXPOSURE_TIME, safeExposure.exposureNs);
+            still.set(CaptureRequest.SENSOR_SENSITIVITY, safeExposure.iso);
+            if (safeExposure.postRawBoost > 100) {
+                Range<Integer> boostRange = info.get(CameraCharacteristics.CONTROL_POST_RAW_SENSITIVITY_BOOST_RANGE);
+                if (boostRange != null) {
+                    still.set(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST,
+                            boostRange.clamp(safeExposure.postRawBoost));
+                }
+            }
+            if (Boolean.TRUE.equals(info.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE))) {
+                still.set(CaptureRequest.CONTROL_AWB_LOCK, true);
+            }
+        } else if (Boolean.TRUE.equals(info.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE))) {
             still.set(CaptureRequest.CONTROL_AE_LOCK, lockExposure
                     || Boolean.TRUE.equals(preview.get(CaptureRequest.CONTROL_AE_LOCK)));
         }
@@ -318,6 +357,7 @@ final class StillStream {
     private final class Burst {
         final int targetCount, degrees;
         final boolean keepDng;
+        final float fallbackGuardEv;
         final BurstCallback callback;
         final Map<Long, TotalCaptureResult> results = new LinkedHashMap<>();
         final Map<Long, Long> aliasToKey = new LinkedHashMap<>();
@@ -327,6 +367,11 @@ final class StillStream {
         BurstRawMerger merger;
         RawRenderer.RawGeometry geo;
         TotalCaptureResult refResult;
+        short[] firstPixels;
+        float firstSharpness;
+        TotalCaptureResult firstResult;
+        RawRenderer.RawGeometry firstGeo;
+        float[] firstNoise;
         final Runnable overallTimeout = () -> {
             if (activeBurst != this) return;
             if (matched > 0) finalizeBurst();
@@ -336,10 +381,11 @@ final class StillStream {
             if (activeBurst == this && matched > 0) finalizeBurst();
         };
 
-        Burst(int targetCount, int degrees, boolean keepDng, BurstCallback callback) {
+        Burst(int targetCount, int degrees, boolean keepDng, float fallbackGuardEv, BurstCallback callback) {
             this.targetCount = targetCount;
             this.degrees = degrees;
             this.keepDng = keepDng;
+            this.fallbackGuardEv = fallbackGuardEv;
             this.callback = callback;
         }
 
@@ -389,26 +435,67 @@ final class StillStream {
                 try (Image frame = image) {
                     if (failedOnDev) return;
                     if (countNow == 1) {
-                        geo = RawRenderer.inspectRaw(frame, info, phys);
-                        refResult = phys;
+                        firstGeo = RawRenderer.inspectRaw(frame, info, phys);
+                        firstResult = phys;
                         if (keepDng) {
                             callback.onFirstFrameForDng(frame, info, phys, degrees);
                         }
-                        float[] noise = RawRenderer.readNoiseProfile(phys);
+                        firstNoise = RawRenderer.readNoiseProfile(phys);
                         ShortBuffer buf = frame.getPlanes()[0].getBuffer().slice()
                                 .order(ByteOrder.nativeOrder()).asShortBuffer();
-                        short[] refPixels = BurstRawMerger.extractActive(buf, geo.stride,
-                                geo.crop.left, geo.crop.top, geo.crop.width(), geo.crop.height());
-                        merger = new BurstRawMerger(geo.crop.width(), geo.crop.height(),
-                                geo.channel, geo.black, geo.white, noise[0], noise[1]);
-                        merger.setReference(refPixels);
-                    } else if (merger != null && geo != null) {
+                        firstPixels = BurstRawMerger.extractActive(buf, firstGeo.stride,
+                                firstGeo.crop.left, firstGeo.crop.top,
+                                firstGeo.crop.width(), firstGeo.crop.height());
+                        firstSharpness = BurstRawMerger.measureSharpness(firstPixels,
+                                firstGeo.crop.width(), firstGeo.crop.height(), firstGeo.channel);
+                    } else if (merger == null && firstPixels != null && firstGeo != null) {
                         RawRenderer.RawGeometry g2 = RawRenderer.inspectRaw(frame, info, phys);
-                        if (g2.crop.width() == geo.crop.width() && g2.crop.height() == geo.crop.height()) {
+                        if (g2.crop.width() == firstGeo.crop.width()
+                                && g2.crop.height() == firstGeo.crop.height()) {
                             ShortBuffer buf = frame.getPlanes()[0].getBuffer().slice()
                                     .order(ByteOrder.nativeOrder()).asShortBuffer();
-                            short[] alt = BurstRawMerger.extractActive(buf, g2.stride,
+                            short[] secondPixels = BurstRawMerger.extractActive(buf, g2.stride,
                                     g2.crop.left, g2.crop.top, g2.crop.width(), g2.crop.height());
+                            float secondSharpness = BurstRawMerger.measureSharpness(secondPixels,
+                                    g2.crop.width(), g2.crop.height(), g2.channel);
+                            if (secondSharpness > firstSharpness * 1.03f) {
+                                float[] noise2 = RawRenderer.readNoiseProfile(phys);
+                                geo = g2;
+                                refResult = phys;
+                                merger = new BurstRawMerger(g2.crop.width(), g2.crop.height(),
+                                        g2.channel, g2.black, g2.white, noise2[0], noise2[1]);
+                                merger.setReference(secondPixels);
+                                merger.mergeFrame(firstPixels, BayerPipeline.POOL);
+                                Log.i("TrueHue.Camera", String.format("Lucky Imaging: chose frame 2 (%.4f vs %.4f)",
+                                        secondSharpness, firstSharpness));
+                            } else {
+                                geo = firstGeo;
+                                refResult = firstResult;
+                                merger = new BurstRawMerger(firstGeo.crop.width(), firstGeo.crop.height(),
+                                        firstGeo.channel, firstGeo.black, firstGeo.white,
+                                        firstNoise[0], firstNoise[1]);
+                                merger.setReference(firstPixels);
+                                merger.mergeFrame(secondPixels, BayerPipeline.POOL);
+                            }
+                        } else {
+                            geo = firstGeo;
+                            refResult = firstResult;
+                            merger = new BurstRawMerger(firstGeo.crop.width(), firstGeo.crop.height(),
+                                    firstGeo.channel, firstGeo.black, firstGeo.white,
+                                    firstNoise[0], firstNoise[1]);
+                            merger.setReference(firstPixels);
+                        }
+                        firstPixels = null;
+                        firstResult = null;
+                        firstGeo = null;
+                        firstNoise = null;
+                    } else if (merger != null && geo != null) {
+                        RawRenderer.RawGeometry gAlt = RawRenderer.inspectRaw(frame, info, phys);
+                        if (gAlt.crop.width() == geo.crop.width() && gAlt.crop.height() == geo.crop.height()) {
+                            ShortBuffer buf = frame.getPlanes()[0].getBuffer().slice()
+                                    .order(ByteOrder.nativeOrder()).asShortBuffer();
+                            short[] alt = BurstRawMerger.extractActive(buf, gAlt.stride,
+                                    gAlt.crop.left, gAlt.crop.top, gAlt.crop.width(), gAlt.crop.height());
                             merger.mergeFrame(alt, BayerPipeline.POOL);
                         }
                     }
@@ -416,6 +503,10 @@ final class StillStream {
                     Log.e("TrueHue.Camera", "Burst frame processing error", e);
                     if (countNow == 1) {
                         failedOnDev = true;
+                        firstPixels = null;
+                        firstResult = null;
+                        firstGeo = null;
+                        firstNoise = null;
                         main.post(() -> callback.onFailure("生成照片失败，请重试。"));
                     }
                 }
@@ -439,17 +530,32 @@ final class StillStream {
             cleanup();
             DEVELOPMENT.execute(() -> {
                 try {
+                    if (!failedOnDev && merger == null && firstPixels != null && firstGeo != null && firstResult != null) {
+                        geo = firstGeo;
+                        refResult = firstResult;
+                        merger = new BurstRawMerger(firstGeo.crop.width(), firstGeo.crop.height(),
+                                firstGeo.channel, firstGeo.black, firstGeo.white, firstNoise[0], firstNoise[1]);
+                        merger.setReference(firstPixels);
+                    }
+                    firstPixels = null;
+                    firstResult = null;
+                    firstGeo = null;
+                    firstNoise = null;
                     if (!failedOnDev && merger != null && geo != null && refResult != null) {
                         BurstRawMerger.Result merged = merger.finish();
                         merger = null;
                         callback.onBurstReady(merged, geo.channel, geo.crop.width(), geo.crop.height(),
-                                info, refResult, degrees);
+                                info, refResult, degrees, fallbackGuardEv);
                     }
                 } catch (Exception | OutOfMemoryError e) {
                     Log.e("TrueHue.Camera", "Burst merge/develop failed", e);
                     main.post(() -> callback.onFailure("生成照片失败，请重试。"));
                 } finally {
                     merger = null;
+                    firstPixels = null;
+                    firstResult = null;
+                    firstGeo = null;
+                    firstNoise = null;
                     worker.post(() -> {
                         processing = false;
                         if (closed) reader.close();

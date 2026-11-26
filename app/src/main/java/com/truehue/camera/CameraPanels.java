@@ -11,6 +11,10 @@ import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.style.AbsoluteSizeSpan;
+import android.text.style.ForegroundColorSpan;
 import android.view.GestureDetector;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -29,6 +33,10 @@ final class CameraPanels {
     private CameraPanels() {}
 
     static Dialog sheet(CameraScreen ui, String title, View body) {
+        return sheet(ui, title, body, null);
+    }
+
+    static Dialog sheet(CameraScreen ui, String title, View body, String closeLabel) {
         Context context = ui.getContext();
         Dialog dialog = new Dialog(context);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
@@ -41,26 +49,34 @@ final class CameraPanels {
         background.setStroke(ui.dp(1), 0xff252529);
         content.setBackground(background);
 
+        LinearLayout scrollContent = new LinearLayout(context);
+        scrollContent.setOrientation(LinearLayout.VERTICAL);
         View handle = new View(context);
         handle.setBackground(ui.rounded(0xff3e3e44, 2, 0));
         LinearLayout.LayoutParams handleLp = new LinearLayout.LayoutParams(ui.dp(36), ui.dp(4));
         handleLp.gravity = Gravity.CENTER_HORIZONTAL;
         handleLp.bottomMargin = ui.dp(12);
-        content.addView(handle, handleLp);
+        scrollContent.addView(handle, handleLp);
 
-        content.addView(heading(ui, title), new LinearLayout.LayoutParams(-1, -2));
+        scrollContent.addView(heading(ui, title), new LinearLayout.LayoutParams(-1, -2));
         View line = new View(context);
         line.setBackgroundColor(CameraScreen.LINE);
         LinearLayout.LayoutParams divider = new LinearLayout.LayoutParams(-1, ui.dp(1));
         divider.topMargin = ui.dp(12);
         divider.bottomMargin = ui.dp(8);
-        content.addView(line, divider);
-        content.addView(body, new LinearLayout.LayoutParams(-1, -2));
+        scrollContent.addView(line, divider);
+        scrollContent.addView(body, new LinearLayout.LayoutParams(-1, -2));
 
         ScrollView scroll = new ScrollView(context);
         scroll.setVerticalScrollBarEnabled(false);
-        scroll.addView(content);
-        dialog.setContentView(scroll);
+        scroll.addView(scrollContent);
+        content.addView(scroll, new LinearLayout.LayoutParams(-1, -2, 1));
+        if (closeLabel != null) {
+            LinearLayout.LayoutParams footer = new LinearLayout.LayoutParams(-1, -2);
+            footer.topMargin = ui.dp(12);
+            content.addView(button(ui, closeLabel, true, v -> dialog.dismiss()), footer);
+        }
+        dialog.setContentView(content);
         Window window = dialog.getWindow();
         window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
         window.setGravity(Gravity.BOTTOM);
@@ -110,6 +126,21 @@ final class CameraPanels {
         footer.addView(button(ui, confirm, true, onConfirm), new LinearLayout.LayoutParams(0, -2, 1));
     }
 
+    static LinearLayout guideItem(CameraScreen ui, String title, String desc) {
+        LinearLayout row = new LinearLayout(ui.getContext());
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(ui.dp(6), ui.dp(8), ui.dp(6), ui.dp(8));
+        TextView heading = ui.label(title, 14, CameraScreen.INK);
+        heading.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        row.addView(heading);
+        TextView body = ui.label(desc, 12, CameraScreen.MUTED);
+        body.setLineSpacing(ui.dp(2), 1f);
+        LinearLayout.LayoutParams descLp = new LinearLayout.LayoutParams(-1, -2);
+        descLp.topMargin = ui.dp(3);
+        row.addView(body, descLp);
+        return row;
+    }
+
     static Dialog photo(CameraScreen ui, View content) {
         Dialog dialog = new Dialog(ui.getContext(), R.style.CameraPhoto);
         dialog.setContentView(content);
@@ -136,9 +167,23 @@ final class CameraPanels {
                 new int[]{0xff525258, CameraScreen.ACCENT, CameraScreen.MUTED}));
         button.setTextSize(14);
         button.setMinHeight(ui.dp(48));
-        button.setPaddingRelative(ui.dp(6), ui.dp(8), ui.dp(6), ui.dp(8));
+        button.setPaddingRelative(ui.dp(6), ui.dp(10), ui.dp(6), ui.dp(10));
         button.setCompoundDrawablePadding(ui.dp(10));
         button.setBackground(ui.ripple(12));
+    }
+
+    static void option(CameraScreen ui, CompoundButton button, String title, String subtitle) {
+        option(ui, button);
+        button.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
+        button.setLineSpacing(ui.dp(2.5f), 1f);
+        SpannableStringBuilder ssb = new SpannableStringBuilder(title);
+        if (subtitle != null && !subtitle.isEmpty()) {
+            int start = ssb.length();
+            ssb.append('\n').append(subtitle);
+            ssb.setSpan(new AbsoluteSizeSpan(12, true), start, ssb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            ssb.setSpan(new ForegroundColorSpan(CameraScreen.MUTED), start, ssb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        button.setText(ssb);
     }
 
     static TextView button(CameraScreen ui, String title, boolean primary, View.OnClickListener click) {

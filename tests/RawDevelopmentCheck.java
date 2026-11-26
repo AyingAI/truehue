@@ -224,6 +224,7 @@ public final class RawDevelopmentCheck {
         BayerPipeline pipe = new BayerPipeline(ShortBuffer.wrap(raw), width, 0, 0, width, height,
                 BAYER[0], BLACK, 1023, UNIT, I, null, 0, 0);
         BayerPipeline.Options options = new BayerPipeline.Options();
+        options.wideGamut = true;
         options.iso = 800;
         options.noiseSlope = .0005f;
         options.buildGainmap = true;
@@ -351,6 +352,228 @@ public final class RawDevelopmentCheck {
         }
         if (gm == null || gm.width != w / 4 || gm.height != h / 4 || gm.maxRatio <= 1.5f) {
             throw new AssertionError("Ultra HDR gainmap invalid");
+        }
+    }
+
+    private static void checkIsoluminantChromaPreservation() {
+        int w = 160, h = 120;
+        int[] cfa = BAYER[0];
+        short[] raw = new short[w * h];
+        Random rng = new Random(19);
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int p = 2 * (y & 1) + (x & 1);
+                int c = cfa[p];
+                float val;
+                if (x >= w - 16 && y < 16) {
+                    val = 1.0f; // Bright lamp to stress dynamic range
+                } else if (x < 80) {
+                    val = 0.05f;
+                } else {
+                    val = c == 0 ? 0.145f : 0.025f; // Isoluminant saturated red
+                }
+                float noise = (c == 0 || c == 3) ? (float) (rng.nextGaussian() * 0.032) : 0f;
+                raw[y * w + x] = (short) Math.max(0, Math.min(10000, Math.round(10000f * (val + noise))));
+            }
+        }
+        BayerPipeline pipe = new BayerPipeline(ShortBuffer.wrap(raw), w, 0, 0, w, h, cfa,
+                new float[4], 10000f, UNIT, I, null, 0, 0);
+
+        BayerPipeline.Options noDnOpt = new BayerPipeline.Options();
+        noDnOpt.natural = true;
+        noDnOpt.wideGamut = true;
+        noDnOpt.iso = 0;
+        int[] noDn = new int[w * h];
+        pipe.render(0, noDnOpt, (px, ox, oy, pw, ph) -> {
+            for (int r = 0; r < ph; r++) System.arraycopy(px, r * pw, noDn, (oy + r) * w + ox, pw);
+        });
+
+        BayerPipeline.Options dnOpt = new BayerPipeline.Options();
+        dnOpt.natural = true;
+        dnOpt.wideGamut = true;
+        dnOpt.iso = 1600;
+        dnOpt.noiseSlope = 0.0022f;
+        dnOpt.sceneEv = 4.5f;
+        int[] withDn = new int[w * h];
+        pipe.render(0, dnOpt, (px, ox, oy, pw, ph) -> {
+            for (int r = 0; r < ph; r++) System.arraycopy(px, r * pw, withDn, (oy + r) * w + ox, pw);
+        });
+
+        double grayBefore = chromaSpread(noDn, w, 12, 68, 30, 108);
+        double grayAfter = chromaSpread(withDn, w, 12, 68, 30, 108);
+        if (grayAfter > grayBefore * 0.35) {
+            throw new AssertionError("Isoluminant bilateral denoise failed on gray: " + grayBefore + " -> " + grayAfter);
+        }
+        double redDiffBefore = meanRedMinusGreen(noDn, w, 84, 148, 30, 108);
+        double redDiffAfter = meanRedMinusGreen(withDn, w, 84, 148, 30, 108);
+        if (redDiffAfter < redDiffBefore * 0.80) {
+            throw new AssertionError("Dim red chroma bleached: " + redDiffBefore + " -> " + redDiffAfter);
+        }
+    }
+
+    private static double meanRedMinusGreen(int[] argb, int stride, int x0, int x1, int y0, int y1) {
+        double sum = 0;
+        int n = 0;
+        for (int y = y0; y < y1; y++) {
+            for (int x = x0; x < x1; x++) {
+                int v = argb[y * stride + x];
+                sum += ((v >> 16) & 255) - ((v >> 8) & 255);
+                n++;
+            }
+        }
+        return sum / Math.max(1, n);
+    }
+
+    private static void checkDisplayP3AndOkLab() {
+        float[] srgbToP3 = SensorColorMatrix.srgbMatrixToDisplayP3(I);
+        near(srgbToP3[0], 0.82246, 0.0002);
+        near(srgbToP3[3], 0.03319, 0.0002);
+        near(srgbToP3[6], 0.01708, 0.0002);
+        for (int r = 0; r < 3; r++) {
+            near(srgbToP3[3 * r] + srgbToP3[3 * r + 1] + srgbToP3[3 * r + 2], 1, 0.0002);
+        }
+
+        int w = 128, h = 64;
+        short[] raw = new short[w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) raw[y * w + x] = (short) Math.min(10000, x * 80);
+        }
+        BayerPipeline rampPipe = new BayerPipeline(ShortBuffer.wrap(raw), w, 0, 0, w, h, BAYER[0],
+                new float[4], 10000f, UNIT, I, null, 0, 0);
+        BayerPipeline.Options p3Opt = new BayerPipeline.Options();
+        p3Opt.natural = true;
+        p3Opt.wideGamut = true;
+        p3Opt.iso = 100;
+        int[] p3Ramp = new int[w * h];
+        rampPipe.render(0, p3Opt, (px, ox, oy, pw, ph) -> {
+            for (int r = 0; r < ph; r++) System.arraycopy(px, r * pw, p3Ramp, (oy + r) * w + ox, pw);
+        });
+        int prev = 0;
+        for (int x = 2; x < w - 2; x++) {
+            int v = p3Ramp[32 * w + x], c = v & 255;
+            if (c < prev || c != ((v >> 8) & 255) || c != ((v >> 16) & 255)) {
+                throw new AssertionError("Display P3 neutral ramp tinted or non-monotonic at x=" + x);
+            }
+            prev = c;
+        }
+
+        // Low-light scene EV should lift perceptual chroma gently relative to bright EV while preserving hue order.
+        BayerPipeline warmPipe = frame(sensor(BAYER[0], new float[]{0.32f, 0.16f, 0.16f, 0.08f}, false),
+                BAYER[0], UNIT, I);
+        BayerPipeline.Options brightOpt = new BayerPipeline.Options();
+        brightOpt.natural = true;
+        brightOpt.wideGamut = true;
+        brightOpt.sceneEv = 11.0f;
+        int[] brightPx = new int[warmPipe.width * warmPipe.height];
+        warmPipe.render(0, brightOpt, (px, ox, oy, pw, ph) -> {
+            for (int r = 0; r < ph; r++) System.arraycopy(px, r * pw, brightPx, (oy + r) * warmPipe.width + ox, pw);
+        });
+        BayerPipeline.Options dimOpt = new BayerPipeline.Options();
+        dimOpt.natural = true;
+        dimOpt.wideGamut = true;
+        dimOpt.sceneEv = 4.0f;
+        int[] dimPx = new int[warmPipe.width * warmPipe.height];
+        warmPipe.render(0, dimOpt, (px, ox, oy, pw, ph) -> {
+            for (int r = 0; r < ph; r++) System.arraycopy(px, r * pw, dimPx, (oy + r) * warmPipe.width + ox, pw);
+        });
+        int bp = brightPx[0], dp = dimPx[0];
+        int br = (bp >> 16) & 255, bg = (bp >> 8) & 255, bb = bp & 255;
+        int dr = (dp >> 16) & 255, dg = (dp >> 8) & 255, db = dp & 255;
+        if (!(dr > dg && dg > db && (dr - db) >= (br - bb))) {
+            throw new AssertionError("Low-light OkLab perceptual chroma recovery failed");
+        }
+    }
+
+    private static void checkVeilingGlareAnchor() {
+        int w = 160, h = 120;
+        short[] raw = new short[w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) raw[y * w + x] = (short) (x < 32 ? 150 : 7500);
+        }
+        BayerPipeline pipe = new BayerPipeline(ShortBuffer.wrap(raw), w, 0, 0, w, h, BAYER[0],
+                new float[4], 10000f, UNIT, I, null, 0, 0);
+        BayerPipeline.Options teleOpt = new BayerPipeline.Options();
+        teleOpt.natural = true;
+        teleOpt.wideGamut = true;
+        teleOpt.equivalentMm = 60f;
+        teleOpt.iso = 100;
+        int[] out = new int[w * h];
+        pipe.render(0, teleOpt, (px, ox, oy, pw, ph) -> {
+            for (int r = 0; r < ph; r++) System.arraycopy(px, r * pw, out, (oy + r) * w + ox, pw);
+        });
+        int floorCode = out[(h / 2) * w + 10] & 255;
+        int unanchoredCode = encode(0.015);
+        if (floorCode >= unanchoredCode) {
+            throw new AssertionError("Veiling glare floor was not anchored: " + floorCode + " vs " + unanchoredCode);
+        }
+    }
+
+    private static void checkIncompleteChromaticAdaptation() {
+        float[] cal1 = {0.99219f, 0, 0, 0, 1, 0, 0, 0, 0.99219f};
+        float[] cm1 = {0.85156f, -0.28906f, -0.10938f, -0.375f, 1.25f, 0.09375f, -0.05469f, 0.28906f, 0.42188f};
+        float[] cm2 = {1.35156f, -0.73438f, -0.10156f, -0.47656f, 1.41406f, 0.32812f, -0.03125f, 0.14844f, 0.76562f};
+        float[] fmStatic = {0.54688f, 0.29688f, 0.11719f, 0.17188f, 0.92969f, -0.09375f, -0.03125f, -0.4375f, 1.29688f};
+
+        float[] warmNeutral = {0.85f, 1.0f, 0.35f};
+        SensorColorMatrix.Result warmRes = SensorColorMatrix.fromDngCalibrated(
+                warmNeutral, cal1, cal1, cm1, cm2, fmStatic, fmStatic, 21, 17,
+                true, 0f, 0f, true, 0.24f);
+        float[] wnOut = new float[3];
+        for (int r = 0; r < 3; r++) {
+            wnOut[r] = warmRes.matrix[3 * r] * warmRes.neutral[0]
+                    + warmRes.matrix[3 * r + 1] * warmRes.neutral[1]
+                    + warmRes.matrix[3 * r + 2] * warmRes.neutral[2];
+        }
+        if (!(wnOut[0] > wnOut[1] && wnOut[1] > wnOut[2] && wnOut[0] / wnOut[2] > 1.04f)) {
+            throw new AssertionError("Warm incomplete adaptation did not preserve warm ambience: "
+                    + Arrays.toString(wnOut));
+        }
+
+        SensorColorMatrix.Result manualRes = SensorColorMatrix.fromDngCalibrated(
+                warmNeutral, cal1, cal1, cm1, cm2, fmStatic, fmStatic, 21, 17,
+                true, 3200f, 0f, true, 0.24f);
+        for (int r = 0; r < 3; r++) {
+            float sum = manualRes.wbMatrix[3 * r] + manualRes.wbMatrix[3 * r + 1] + manualRes.wbMatrix[3 * r + 2];
+            near(sum, 1.0, 0.002);
+        }
+    }
+
+    private static void checkBurstLuckyImagingAndBlurReject() {
+        int w = 192, h = 160;
+        int[] cfa = BAYER[0];
+        float[] black = {64, 64, 64, 64};
+        short[] sharp = new short[w * h];
+        short[] blurred = new short[w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                sharp[y * w + x] = (short) (((x / 8 + y / 8) % 2 == 0) ? 720 : 240);
+            }
+        }
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int sum = 0, cnt = 0;
+                for (int dy = -6; dy <= 6; dy += 2) {
+                    int sy = Math.max(0, Math.min(h - 1, y + dy));
+                    for (int dx = -6; dx <= 6; dx += 2) {
+                        int sx = Math.max(0, Math.min(w - 1, x + dx));
+                        sum += sharp[sy * w + sx] & 0xffff;
+                        cnt++;
+                    }
+                }
+                blurred[y * w + x] = (short) (sum / cnt);
+            }
+        }
+        float sSharp = BurstRawMerger.measureSharpness(sharp, w, h, cfa);
+        float sBlur = BurstRawMerger.measureSharpness(blurred, w, h, cfa);
+        if (!(sSharp > sBlur * 1.4f)) {
+            throw new AssertionError("Sharpness scorer failed to separate sharp vs blurred: " + sSharp + " vs " + sBlur);
+        }
+        BurstRawMerger merger = new BurstRawMerger(w, h, cfa, black, 1023f, 0.0005f, 1e-6f);
+        merger.setReference(sharp);
+        merger.mergeFrame(blurred, BayerPipeline.POOL);
+        BurstRawMerger.Result res = merger.finish();
+        if (res.frameCount != 1 || res.effectiveFrames > 1.01f) {
+            throw new AssertionError("Blurry frame was not rejected: frames=" + res.frameCount);
         }
     }
 
@@ -516,6 +739,11 @@ public final class RawDevelopmentCheck {
         checkFullRangeBurst();
         if (Arrays.asList(args).contains("--full")) checkFullResolution();
         checkChromaDenoisingAndGainmap();
+        checkIsoluminantChromaPreservation();
+        checkDisplayP3AndOkLab();
+        checkVeilingGlareAnchor();
+        checkIncompleteChromaticAdaptation();
+        checkBurstLuckyImagingAndBlurReject();
         checkUltraHdrPatcher();
         for (int[] cfa : BAYER) {
             short[] raw = sensor(cfa,new float[]{0.22f,0.3f,0.15f,0.55f},false);

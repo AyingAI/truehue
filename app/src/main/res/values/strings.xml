@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="current_filter">滤镜，当前%1$s</string>
-    <string name="keep_dng_label">同时保留 DNG 原始底片</string>
-    <string name="same_frame_label">同取景 · 保存屏幕上看到的相机帧</string>
+    <string name="current_filter">风格，当前%1$s</string>
+    <string name="camera_version">版本 %1$s</string>
+    <string name="camera_version_unknown">版本未知</string>
 </resources>

@@ -39,6 +39,7 @@ final class BurstRawMerger {
     private final int w4, h4, w8, h8;
     private short[] ref;
     private float[] refGreen4, refGreen8;
+    private float refSharpness;
     private int[] accum;
     private short[] weightSum;
     private int frameCount;
@@ -78,6 +79,7 @@ final class BurstRawMerger {
         this.ref = bayer;
         this.refGreen4 = buildGreen4(bayer);
         this.refGreen8 = buildGreen8(refGreen4);
+        this.refSharpness = measureSharpness(bayer, width, height, channel);
         int n = bayer.length;
         this.accum = new int[n];
         this.weightSum = new short[n];
@@ -94,6 +96,10 @@ final class BurstRawMerger {
             return;
         }
         if (alt.length != width * height) return;
+        float altSharpness = measureSharpness(alt, width, height, channel);
+        if (refSharpness > 1e-5f && altSharpness < 0.72f * refSharpness) {
+            return;
+        }
         float[] altGreen4 = buildGreen4(alt);
         float[] altGreen8 = buildGreen8(altGreen4);
 
@@ -205,6 +211,51 @@ final class BurstRawMerger {
         float norm = Math.max(0f, (dn - blackMean) / range);
         float singleVar = Math.max(12f, (noiseSlope * norm + noiseOffset) * range * range);
         return 2.0f * singleVar;
+    }
+
+    /** Computes phase-invariant center-crop sharpness on 2x2 Bayer green quads (zero full-frame allocation). */
+    static float measureSharpness(short[] bayer, int width, int height, int[] channel) {
+        if (bayer == null || bayer.length < width * height || width < 16 || height < 16) return 0f;
+        int w2 = width / 2, h2 = height / 2;
+        int x0 = Math.max(1, w2 / 5), x1 = Math.min(w2 - 1, w2 - w2 / 5);
+        int y0 = Math.max(1, h2 / 5), y1 = Math.min(h2 - 1, h2 - h2 / 5);
+        int cw = x1 - x0 + 2;
+        if (cw < 4 || y1 - y0 < 2) return 0f;
+        int gA = (channel[0] == 1 || channel[0] == 2) ? 0 : 1;
+        int gB = (channel[2] == 1 || channel[2] == 2) ? 0 : 1;
+        float[] prev = new float[cw], curr = new float[cw], next = new float[cw];
+        loadGreen2Row(bayer, width, y0 - 1, x0 - 1, cw, gA, gB, prev);
+        loadGreen2Row(bayer, width, y0, x0 - 1, cw, gA, gB, curr);
+        double gradSum = 0.0, sigSum = 0.0;
+        int count = 0;
+        for (int y2 = y0; y2 < y1; y2++) {
+            loadGreen2Row(bayer, width, y2 + 1, x0 - 1, cw, gA, gB, next);
+            for (int c = 1; c < cw - 1; c++) {
+                float val = curr[c];
+                float gx = Math.abs(curr[c + 1] - curr[c - 1]);
+                float gy = Math.abs(next[c] - prev[c]);
+                gradSum += gx + gy;
+                sigSum += val;
+                count++;
+            }
+            float[] tmp = prev;
+            prev = curr;
+            curr = next;
+            next = tmp;
+        }
+        if (count == 0) return 0f;
+        double mean = sigSum / count;
+        return (float) ((gradSum / count) / Math.max(1.0, mean));
+    }
+
+    private static void loadGreen2Row(short[] bayer, int width, int y2, int x2Start, int len,
+                                      int gA, int gB, float[] dst) {
+        int r0 = (y2 * 2) * width;
+        int r1 = r0 + width;
+        for (int i = 0; i < len; i++) {
+            int x = (x2Start + i) * 2;
+            dst[i] = 0.5f * ((bayer[r0 + x + gA] & 0xffff) + (bayer[r1 + x + gB] & 0xffff));
+        }
     }
 
     private float[] buildGreen4(short[] bayer) {

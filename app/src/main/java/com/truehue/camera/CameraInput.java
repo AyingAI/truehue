@@ -134,7 +134,7 @@ public final class CameraInput {
             }
             int rotation = Math.floorMod(run.orientation() + deviceRotation, 360);
             run.still.captureBurst(run.session, run.device, run.request.build(), rotation,
-                    burstCount, keepDng, callback);
+                    burstCount, keepDng, run.computeSafeExposure(), callback);
         });
     }
 
@@ -147,6 +147,16 @@ public final class CameraInput {
     public int latestIso() {
         Run run = current;
         return run == null ? 0 : run.latestIso;
+    }
+
+    public long latestExposureNs() {
+        Run run = current;
+        return run == null ? 0L : run.latestExposureNs;
+    }
+
+    public boolean isHighlightProtected() {
+        Run run = current;
+        return run != null && run.highlightProtected;
     }
 
     public void protectHighlights(boolean enabled) {
@@ -195,8 +205,11 @@ public final class CameraInput {
         Setup selected;
         int guardSteps, userSteps, appliedSteps;
         float evStepValue = 1f / 6f, evMin = -2f, evMax = 2f;
-        boolean highlightProtected;
+        volatile boolean highlightProtected;
         volatile int latestIso;
+        volatile long latestExposureNs;
+        volatile int latestPostRawBoost = 100;
+        volatile int latestAeState;
         long lastTelemetryMs;
         final Runnable resetAfTask = this::clearFocusLock;
         volatile boolean ended;
@@ -434,7 +447,12 @@ public final class CameraInput {
                 Long expVal = src.get(CaptureResult.SENSOR_EXPOSURE_TIME);
                 Float apVal = src.get(CaptureResult.LENS_APERTURE);
                 Integer afVal = src.get(CaptureResult.CONTROL_AF_STATE);
+                Integer boostVal = src.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST);
+                Integer aeVal = src.get(CaptureResult.CONTROL_AE_STATE);
                 if (isoVal != null) latestIso = isoVal;
+                if (expVal != null) latestExposureNs = expVal;
+                if (boostVal != null && boostVal > 0) latestPostRawBoost = boostVal;
+                if (aeVal != null) latestAeState = aeVal;
                 int kelvin = Math.round(estimateResultKelvin(src));
                 float bias = appliedSteps * evStepValue;
                 Telemetry t = new Telemetry(
@@ -473,6 +491,45 @@ public final class CameraInput {
                     toArray(characteristics.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1)),
                     toArray(characteristics.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2)),
                     i1 == null ? 0 : i1.intValue(), i2 == null ? 0 : i2.intValue());
+        }
+
+        StillStream.SafeExposure computeSafeExposure() {
+            if (characteristics == null || lens == null || latestExposureNs <= 0L || latestIso <= 0) return null;
+            if (latestAeState != CaptureResult.CONTROL_AE_STATE_CONVERGED
+                    && latestAeState != CaptureResult.CONTROL_AE_STATE_LOCKED
+                    && latestAeState != CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED) {
+                return null;
+            }
+            int[] caps = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES);
+            if (!contains(caps, CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)) return null;
+            Range<Integer> sensRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
+            Range<Long> expRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
+            if (sensRange == null || expRange == null) return null;
+
+            int[] oisModes = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION);
+            boolean hasOis = contains(oisModes, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON);
+            long maxSafeExpNs;
+            if (lens.equivalentMm > 0 && lens.equivalentMm < 20) {
+                maxSafeExpNs = 40_000_000L;
+            } else if (lens.equivalentMm >= 45) {
+                maxSafeExpNs = hasOis ? 20_000_000L : 12_500_000L;
+            } else {
+                maxSafeExpNs = hasOis ? 33_333_333L : 25_000_000L;
+            }
+            if (latestExposureNs <= maxSafeExpNs) return null;
+
+            double maxScale = Math.min(2.5, (double) sensRange.getUpper() / latestIso);
+            double scale = Math.min(maxScale, (double) latestExposureNs / maxSafeExpNs);
+            if (scale < 1.25) return null;
+
+            long targetExp = Math.max(expRange.getLower(),
+                    Math.min(expRange.getUpper(), Math.round(latestExposureNs / scale)));
+            int targetIso = Math.max(sensRange.getLower(),
+                    Math.min(sensRange.getUpper(), (int) Math.round(latestIso * scale)));
+            float fallbackEv = (userSteps == 0 && highlightProtected) ? (guardSteps * evStepValue) : Float.NaN;
+            Log.i(TAG, String.format("Anti-shake split: exp %.1fms->%.1fms, ISO %d->%d (lens=%dmm, OIS=%s)",
+                    latestExposureNs * 1e-6, targetExp * 1e-6, latestIso, targetIso, lens.equivalentMm, hasOis));
+            return new StillStream.SafeExposure(targetExp, targetIso, latestPostRawBoost, fallbackEv);
         }
 
         void setHighlightProtection(boolean enabled) {

@@ -7,9 +7,12 @@ import android.content.ContentUris;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.Configuration;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.ColorSpace;
+import android.graphics.Rect;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
@@ -22,14 +25,17 @@ import android.provider.MediaStore;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.inspector.WindowInspector;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.DataInputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
@@ -55,14 +61,15 @@ public final class LensSmoke extends Instrumentation {
         boolean includeDng = Boolean.parseBoolean(args.getString("dng", "true"));
         boolean paired = Boolean.parseBoolean(args.getString("compare", "false"));
         boolean exposureOnly = Boolean.parseBoolean(args.getString("exposureOnly", "false"));
+        boolean panelsOnly = Boolean.parseBoolean(args.getString("panelsOnly", "false"));
         Bundle out = new Bundle();
         int code = Activity.RESULT_OK;
         MainActivity activity = null;
         try {
-            prefs.edit().putBoolean("sameFrame", false).putBoolean("liveRaw", !exposureOnly)
+            prefs.edit().putBoolean("sameFrame", false).putBoolean("liveRaw", !exposureOnly && !panelsOnly)
                     .putBoolean("multiFrame", true).putBoolean("ultraHdr", android.os.Build.VERSION.SDK_INT >= 34)
-                    .putBoolean("naturalLight", true).putBoolean("compareBaseline", paired)
-                    .putBoolean("keepDng", includeDng).putString("photoFilter", PhotoFilter.ORIGINAL.id).commit();
+                    .putBoolean("keepDng", includeDng).putBoolean("guideShown", !panelsOnly)
+                    .putString("photoFilter", PhotoFilter.ORIGINAL.id).commit();
             Intent open = new Intent(target, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             ActivityMonitor monitor = addMonitor(MainActivity.class.getName(), null, false);
             sendLine("正在打开本色相机");
@@ -70,15 +77,24 @@ public final class LensSmoke extends Instrumentation {
             activity = (MainActivity) waitForMonitorWithTimeout(monitor, 20000);
             if (activity == null) throw new AssertionError("本色相机未进入前台");
             MainActivity launched = activity;
+            if (paired) {
+                var comparison = MainActivity.class.getDeclaredField("compareBaseline");
+                comparison.setAccessible(true);
+                comparison.setBoolean(launched, true);
+            }
             CameraScreen ui = onUi(() -> (CameraScreen) ((ViewGroup) launched.findViewById(android.R.id.content)).getChildAt(0));
             if (exposureOnly) {
                 await("主摄测光就绪", () -> onUi(() -> ui.shutter.isEnabled()), ui);
                 verifyExposureControl(launched, ui);
                 out.putString("result", "Exposure metering passed.");
-            } else if (Boolean.parseBoolean(args.getString("settingsOnly", "false"))) {
-                verifyPanels(target, prefs, ui, includeDng);
-                verifyFilters(target, prefs, ui);
-                out.putString("result", "Settings, photo review, filter selection, RAW and viewfinder filter saves passed.");
+            } else if (panelsOnly || Boolean.parseBoolean(args.getString("settingsOnly", "false"))) {
+                verifyPanels(target, prefs, ui, includeDng, panelsOnly);
+                if (panelsOnly) {
+                    out.putString("result", "Camera controls and panels passed.");
+                } else {
+                    verifyFilters(target, prefs, ui);
+                    out.putString("result", "Settings, photo review, filter selection, RAW and viewfinder filter saves passed.");
+                }
             } else {
                 for (int i = 0; i < choices.length; i++) {
                     checkLens(target, prefs, ui, choices[i], includeDng && (paired || i == 0), paired);
@@ -92,7 +108,7 @@ public final class LensSmoke extends Instrumentation {
         } finally {
             if (activity != null) runOnMainSync(activity::finish);
             SharedPreferences.Editor edit = prefs.edit();
-            for (String k : new String[]{"sameFrame", "liveRaw", "multiFrame", "ultraHdr", "keepDng", "naturalLight", "compareBaseline"}) {
+            for (String k : new String[]{"sameFrame", "liveRaw", "multiFrame", "ultraHdr", "keepDng", "guideShown", "showProInfo", "showHistogram"}) {
                 if (before.containsKey(k)) edit.putBoolean(k, (Boolean) before.get(k));
                 else edit.remove(k);
             }
@@ -119,7 +135,7 @@ public final class LensSmoke extends Instrumentation {
         await("返回焦距选择", () -> onUi(() -> !hasText("层次") && ui.lensBar.isShown()), ui);
 
         onUi(() -> { ui.mode.performClick(); return null; });
-        clickDialogText("同取景 · 保存屏幕上看到的相机帧");
+        clickDialogText("极速快拍");
         clickDialogText("完成");
         await("同取景就绪", () -> prefs.getBoolean("sameFrame", false), ui);
         onUi(() -> { ui.filterButton.performClick(); return null; });
@@ -144,17 +160,52 @@ public final class LensSmoke extends Instrumentation {
         sendLine(software + " | " + filter.id + " | " + (SystemClock.elapsedRealtime() - start) + " ms | " + uri);
     }
 
-    private void verifyPanels(Context context, SharedPreferences prefs, CameraScreen ui, boolean dng) throws Exception {
+    private void verifyPanels(Context context, SharedPreferences prefs, CameraScreen ui, boolean dng, boolean firstLaunch) throws Exception {
         await("原彩拍摄设置", () -> onUi(() -> ui.shutter.isEnabled() && ui.mode.isEnabled()), ui);
+        onUi(() -> {
+            verifyHeaderTargets(ui);
+            Configuration config = new Configuration(ui.getResources().getConfiguration());
+            config.fontScale = 2f;
+            CameraScreen compact = new CameraScreen(ui.getContext().createConfigurationContext(config));
+            compact.measure(View.MeasureSpec.makeMeasureSpec(compact.dp(320), View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(compact.dp(600), View.MeasureSpec.EXACTLY));
+            compact.layout(0, 0, compact.getMeasuredWidth(), compact.getMeasuredHeight());
+            verifyHeaderTargets(compact);
+            return null;
+        });
+        if (!firstLaunch) onUi(() -> { ui.helpButton.performClick(); return null; });
+        await("新手指南", () -> onUi(() -> hasText("本色相机 · 新手指南")), ui);
+        verifyGuideFooter("知道了，开始拍照");
+        screenshot(context, "guide");
+        clickDialogText("知道了，开始拍照");
+        if (!waitFor(4000, () -> onUi(() -> !hasText("本色相机 · 新手指南"))))
+            throw new AssertionError("新手指南未关闭");
+        boolean proInfo = prefs.getBoolean("showProInfo", false);
+        boolean histogram = prefs.getBoolean("showHistogram", false);
         onUi(() -> { ui.mode.performClick(); return null; });
+        String version = "版本 " + context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionName;
+        await("设置显示安装版本", () -> onUi(() -> {
+            TextView label = dialogText(version);
+            return label != null && !label.isClickable();
+        }), ui);
         screenshot(context, "settings");
-        clickDialogText("同时保留 DNG 原始底片");
+        clickDialogText("专业拍摄参数");
+        clickDialogText("直方图");
         clickDialogText("取消");
-        if (!waitFor(4000, () -> onUi(() -> !hasText("完成"))) || prefs.getBoolean("keepDng", !dng) != dng)
-            throw new AssertionError("取消修改了拍摄设置");
+        await("取消保留拍照辅助偏好", () -> onUi(() -> !hasText("完成"))
+                && prefs.getBoolean("showProInfo", false) == proInfo
+                && prefs.getBoolean("showHistogram", false) == histogram, ui);
+        onUi(() -> { ui.mode.performClick(); return null; });
+        clickDialogText("专业拍摄参数");
+        clickDialogText("直方图");
+        clickDialogText("完成");
+        await("完成保存拍照辅助偏好", () -> onUi(() -> !hasText("完成"))
+                && prefs.getBoolean("showProInfo", false) != proInfo
+                && prefs.getBoolean("showHistogram", false) != histogram, ui);
         toggleDng(ui);
         if (!waitFor(3000, () -> prefs.getBoolean("keepDng", dng) != dng))
-            throw new AssertionError("设置没有保存");
+            throw new AssertionError("顶部存底片开关没有保存");
+        verifyQuickToggles(prefs, ui);
         if (prefs.getString("last", "").isEmpty()) return;
         await("缩略图就绪", () -> onUi(ui.gallery::isEnabled), ui);
         onUi(() -> { ui.gallery.performClick(); return null; });
@@ -169,6 +220,68 @@ public final class LensSmoke extends Instrumentation {
         });
         if (!returned || !waitFor(4000, () -> onUi(() -> !hasText("在相册中打开"))))
             throw new AssertionError("未返回取景");
+    }
+
+    private void verifyHeaderTargets(CameraScreen ui) {
+        for (View button : new View[]{ui.helpButton, ui.gridButton, ui.mode}) {
+            Rect bounds = new Rect(0, 0, button.getWidth(), button.getHeight());
+            ui.offsetDescendantRectToMyCoords(button, bounds);
+            if (bounds.width() < ui.dp(48) || bounds.height() < ui.dp(48)
+                    || bounds.left < 0 || bounds.right > ui.getWidth()) {
+                throw new AssertionError("顶部按钮点击区不足 48 dp 或超出屏幕：" + button.getContentDescription());
+            }
+        }
+    }
+
+    private void verifyGuideFooter(String text) {
+        if (!waitFor(4000, () -> onUi(() -> {
+            TextView action = dialogText(text);
+            Rect visible = new Rect();
+            return action != null && action.getHeight() > 0 && action.getGlobalVisibleRect(visible)
+                    && visible.height() == action.getHeight();
+        }))) throw new AssertionError("首次打开指南时底部按钮未完全显示：" + text);
+
+        onUi(() -> {
+            TextView action = dialogText(text);
+            ViewGroup sheet = (ViewGroup) action.getParent();
+            ScrollView body = (ScrollView) sheet.getChildAt(0);
+            int top = action.getTop();
+            int before = body.getScrollY();
+            body.scrollTo(0, body.getChildAt(0).getHeight());
+            if (body.getChildAt(0).getHeight() > body.getHeight() && body.getScrollY() == before) {
+                throw new AssertionError("长指南正文无法滚动");
+            }
+            if (action.getTop() != top || !action.isShown()) {
+                throw new AssertionError("底部按钮随指南正文滚动");
+            }
+            body.scrollTo(0, 0);
+            return null;
+        });
+    }
+
+    private void verifyQuickToggles(SharedPreferences prefs, CameraScreen ui) {
+        boolean dng = prefs.getBoolean("keepDng", false);
+        boolean hdr = prefs.getBoolean("ultraHdr", false);
+        onUi(() -> { ui.mode.performClick(); return null; });
+        clickDialogText("极速快拍");
+        clickDialogText("完成");
+        await("快拍开关均不可用", () -> onUi(() -> prefs.getBoolean("sameFrame", false) && !hasText("完成")
+                && !ui.hdrToggle.isEnabled() && !ui.dngToggle.isEnabled()
+                && !ui.hdrToggle.isSelected() && !ui.dngToggle.isSelected()), ui);
+        onUi(() -> {
+            ui.hdrToggle.performClick();
+            ui.dngToggle.performClick();
+            ui.mode.performClick();
+            return null;
+        });
+        if (prefs.getBoolean("keepDng", !dng) != dng || prefs.getBoolean("ultraHdr", !hdr) != hdr)
+            throw new AssertionError("快拍模式修改了原彩开关偏好");
+        clickDialogText("原彩直出");
+        clickDialogText("完成");
+        await("恢复原彩开关", () -> onUi(() -> !prefs.getBoolean("sameFrame", true) && !hasText("完成")
+                && ui.dngToggle.isEnabled() && ui.dngToggle.isSelected() == dng
+                && (android.os.Build.VERSION.SDK_INT < 34 || ui.hdrToggle.isEnabled()
+                && ui.hdrToggle.isSelected() == hdr)), ui);
     }
 
     private boolean hasText(String text) {
@@ -254,31 +367,43 @@ public final class LensSmoke extends Instrumentation {
     }
 
     private void toggleDng(CameraScreen ui) {
-        onUi(() -> { ui.mode.performClick(); return null; });
-        clickDialogText("同时保留 DNG 原始底片");
-        clickDialogText("完成");
+        await("顶部存底片开关", () -> onUi(ui.dngToggle::isEnabled), ui);
+        onUi(ui.dngToggle::performClick);
     }
 
     private void clickDialogText(String text) {
         boolean found = waitFor(4000, () -> onUi(() -> {
-            for (View root : WindowInspector.getGlobalWindowViews()) if (clickText(root, text)) return true;
-            return false;
+            TextView view = dialogText(text);
+            if (view == null || !view.isEnabled() || !view.isClickable()) return false;
+            view.performClick();
+            return true;
         }));
         if (!found) throw new AssertionError("未找到设置控件 " + text);
     }
 
-    private boolean clickText(View root, String text) {
-        if (root instanceof TextView && root.isShown() && root.isEnabled() && root.isClickable()
-                && text.contentEquals(((TextView) root).getText())) {
-            root.performClick();
-            return true;
+    private TextView dialogText(String text) {
+        for (View root : WindowInspector.getGlobalWindowViews()) {
+            TextView found = findText(root, text);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private TextView findText(View root, String text) {
+        if (root instanceof TextView && root.isShown()) {
+            String label = ((TextView) root).getText().toString();
+            if (label.equals(text) || label.startsWith(text + "\n")) {
+                return (TextView) root;
+            }
         }
         if (root instanceof ViewGroup) {
             ViewGroup children = (ViewGroup) root;
-            for (int i = 0; i < children.getChildCount(); i++)
-                if (clickText(children.getChildAt(i), text)) return true;
+            for (int i = 0; i < children.getChildCount(); i++) {
+                TextView found = findText(children.getChildAt(i), text);
+                if (found != null) return found;
+            }
         }
-        return false;
+        return null;
     }
 
     private void checkLens(Context context, SharedPreferences prefs, CameraScreen ui,
@@ -286,7 +411,7 @@ public final class LensSmoke extends Instrumentation {
         await("镜头列表 " + name, () -> onUi(() -> ui.shutter.isEnabled() && lens(ui, name) != null), ui);
         onUi(() -> { View choice = lens(ui, name); if (!choice.isSelected()) choice.performClick(); return null; });
         await("RAW 镜头就绪 " + name, () -> onUi(() -> ui.shutter.isEnabled() && lens(ui, name) != null && lens(ui, name).isSelected()
-                && ui.mode.getContentDescription().toString().contains("原彩显影")), ui);
+                && ui.mode.getContentDescription().toString().contains("原彩直出")), ui);
         boolean proof = waitFor(7500, () -> onUi(() -> ui.rawPreview.getVisibility() == View.VISIBLE));
         String old = prefs.getString("last", "");
         long start = SystemClock.elapsedRealtime();
@@ -302,10 +427,11 @@ public final class LensSmoke extends Instrumentation {
         }
         try (InputStream in = resolver.openInputStream(uri)) {
             ExifInterface exif = new ExifInterface(in);
+            int colorSpaceTag = exif.getAttributeInt(ExifInterface.TAG_COLOR_SPACE, 0);
             if (!"TrueHue RAW".equals(exif.getAttribute(ExifInterface.TAG_SOFTWARE))
                     || !PhotoFilter.ORIGINAL.exif.equals(exif.getAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION))
-                    || exif.getAttributeInt(ExifInterface.TAG_COLOR_SPACE, 0) != 1) {
-                throw new AssertionError("未找到 RAW 显影 / sRGB 标记");
+                    || colorSpaceTag != 65535) {
+                throw new AssertionError("未找到 RAW 显影 / Display P3 标记: " + colorSpaceTag);
             }
             double focal = exif.getAttributeDouble(ExifInterface.TAG_FOCAL_LENGTH, 0);
             double expected = name.equals("超广角") ? 2.57 : name.equals("长焦") ? 9.00 : 6.62;
@@ -318,17 +444,32 @@ public final class LensSmoke extends Instrumentation {
                     "ISO " + exif.getAttribute(ExifInterface.TAG_ISO_SPEED_RATINGS) + " | " +
                     (SystemClock.elapsedRealtime() - start) + " ms | RAW preview " + proof);
         }
-        if (android.os.Build.VERSION.SDK_INT >= 34) {
-            BitmapFactory.Options hdrOptions = new BitmapFactory.Options();
-            hdrOptions.inSampleSize = 4;
-            try (InputStream in = resolver.openInputStream(uri)) {
-                Bitmap decoded = BitmapFactory.decodeStream(in, null, hdrOptions);
-                if (decoded == null) throw new AssertionError("无法解码 RAW JPEG");
-                try {
-                    if (!decoded.hasGainmap()) throw new AssertionError("未找到 HDR 增益图");
-                } finally {
-                    decoded.recycle();
+        try (InputStream in = resolver.openInputStream(uri)) {
+            ByteArrayOutputStream headBytes = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int r;
+            while (headBytes.size() < 65536 && (r = in.read(buf)) > 0) {
+                headBytes.write(buf, 0, r);
+            }
+            String headAscii = new String(headBytes.toByteArray(), StandardCharsets.ISO_8859_1);
+            if (!headAscii.contains("ICC_PROFILE")) {
+                throw new AssertionError("JPEG 缺少 Display P3 ICC_PROFILE");
+            }
+        }
+        BitmapFactory.Options hdrOptions = new BitmapFactory.Options();
+        hdrOptions.inSampleSize = 4;
+        try (InputStream in = resolver.openInputStream(uri)) {
+            Bitmap decoded = BitmapFactory.decodeStream(in, null, hdrOptions);
+            if (decoded == null) throw new AssertionError("无法解码 RAW JPEG");
+            try {
+                if (!ColorSpace.get(ColorSpace.Named.DISPLAY_P3).equals(decoded.getColorSpace())) {
+                    throw new AssertionError("成片色彩空间不是 Display P3: " + decoded.getColorSpace());
                 }
+                if (android.os.Build.VERSION.SDK_INT >= 34 && !decoded.hasGainmap()) {
+                    throw new AssertionError("未找到 HDR 增益图");
+                }
+            } finally {
+                decoded.recycle();
             }
         }
         if (checkDng) verifyDng(resolver, uri);

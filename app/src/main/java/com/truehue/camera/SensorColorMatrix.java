@@ -14,6 +14,17 @@ final class SensorColorMatrix {
             -0.9692660f, 1.8760108f, 0.0415560f,
             0.0556434f, -0.2040259f, 1.0572252f
     };
+    private static final float[] XYZ50_TO_P3 = {
+            2.4038183f, -0.9897174f, -0.3975865f,
+            -0.8422290f, 1.7988454f, 0.0160549f,
+            0.0481867f, -0.0973766f, 1.2735110f
+    };
+    private static final float[] XYZ65_TO_P3 = {
+            2.4931808f, -0.9312655f, -0.4026597f,
+            -0.8295031f, 1.7626941f, 0.0236251f,
+            0.0358536f, -0.0761890f, 0.9570926f
+    };
+    private static final float[] LINEAR_SRGB_TO_P3 = multiply(XYZ65_TO_P3, invert(XYZ65_TO_SRGB));
     private static final float[] BRADFORD = {
             0.8951f, 0.2664f, -0.1614f,
             -0.7502f, 1.7135f, 0.0367f,
@@ -50,6 +61,10 @@ final class SensorColorMatrix {
         if (m == null || m.length != 9) return false;
         for (float value : m) if (!Float.isFinite(value)) return false;
         return Math.abs(det(m)) > 0.000001f;
+    }
+
+    static float[] srgbMatrixToDisplayP3(float[] sensorToSrgb) {
+        return multiply(LINEAR_SRGB_TO_P3, sensorToSrgb);
     }
 
     static float[] fromDng(float[] neutral, float[] cal1, float[] cal2, float[] color1, float[] color2,
@@ -96,6 +111,16 @@ final class SensorColorMatrix {
                                     float[] forward1, float[] forward2,
                                     int illuminant1, int illuminant2,
                                     boolean guardDuv, float manualKelvin, float manualTint) {
+        return fromDngCalibrated(rawNeutral, cal1, cal2, color1, color2, forward1, forward2,
+                illuminant1, illuminant2, guardDuv, manualKelvin, manualTint, false, 0f);
+    }
+
+    static Result fromDngCalibrated(float[] rawNeutral, float[] cal1, float[] cal2,
+                                    float[] color1, float[] color2,
+                                    float[] forward1, float[] forward2,
+                                    int illuminant1, int illuminant2,
+                                    boolean guardDuv, float manualKelvin, float manualTint,
+                                    boolean wideGamut, float ambienceRetention) {
         if (rawNeutral == null || rawNeutral.length < 3) {
             throw new IllegalArgumentException("相机返回的中性白点无效");
         }
@@ -191,20 +216,55 @@ final class SensorColorMatrix {
             }
         }
 
-        // Prefer dual-illuminant ColorMatrix + Bradford D65 when ForwardMatrix is missing or static across illuminants.
+        // Incomplete chromatic adaptation preserves subtle ambient color warmth/coolness in auto WB.
+        float[] xyz65ToRgb = wideGamut ? XYZ65_TO_P3 : XYZ65_TO_SRGB;
+        float[] xyz50ToRgb = wideGamut ? XYZ50_TO_P3 : XYZ50_TO_SRGB;
+        float[] targetXyz = D65_XYZ;
+        float[] targetRgb = {1f, 1f, 1f};
+        if (manualKelvin < 2000f && ambienceRetention > 0f) {
+            float deltaMired = 0f;
+            if (cct < 4700f) {
+                float warmWeight = smoothStep((4700f - cct) / 1900f);
+                deltaMired = Math.min(24f, ambienceRetention * warmWeight
+                        * (1_000_000f / Math.max(2200f, cct) - 1_000_000f / 6504f));
+            } else if (cct > 7200f) {
+                float coolWeight = smoothStep((cct - 7200f) / 2300f);
+                deltaMired = -Math.min(10f, ambienceRetention * 0.5f * coolWeight
+                        * (1_000_000f / 6504f - 1_000_000f / Math.min(12000f, cct)));
+            }
+            if (Math.abs(deltaMired) > 0.25f) {
+                float targetCct = 1_000_000f / (1_000_000f / 6504f + deltaMired);
+                float[] targetUv = locusUv(targetCct);
+                float[] adaptedXyz = xyzFromUv(targetUv[0], targetUv[1]);
+                float[] adaptedRgb = apply(xyz65ToRgb, adaptedXyz);
+                float lum = wideGamut
+                        ? (0.2290036f * adaptedRgb[0] + 0.6917267f * adaptedRgb[1] + 0.0792697f * adaptedRgb[2])
+                        : (0.2126f * adaptedRgb[0] + 0.7152f * adaptedRgb[1] + 0.0722f * adaptedRgb[2]);
+                if (lum > 1e-4f && adaptedRgb[0] > 0f && adaptedRgb[1] > 0f && adaptedRgb[2] > 0f) {
+                    targetXyz = adaptedXyz;
+                    targetRgb = new float[]{
+                            adaptedRgb[0] / lum,
+                            adaptedRgb[1] / lum,
+                            adaptedRgb[2] / lum
+                    };
+                }
+            }
+        }
+
+        // Prefer dual-illuminant ColorMatrix + Bradford when ForwardMatrix is missing or static across illuminants.
         boolean staticForward = !isUsable(forward1) || !isUsable(forward2) || arraysClose(forward1, forward2, 1e-4f);
-        float[] camToSrgb;
+        float[] camToRgb;
         if (hasColor && xyzW != null && staticForward) {
             float[] camToXyz = invert(multiply(cal, cm));
             float[] srcCone = apply(BRADFORD, xyzW);
-            float[] dstCone = apply(BRADFORD, D65_XYZ);
+            float[] dstCone = apply(BRADFORD, targetXyz);
             float[] diag = {
                     dstCone[0] / Math.max(1e-5f, srcCone[0]), 0, 0,
                     0, dstCone[1] / Math.max(1e-5f, srcCone[1]), 0,
                     0, 0, dstCone[2] / Math.max(1e-5f, srcCone[2])
             };
             float[] adapt = multiply(BRADFORD_INV, multiply(diag, BRADFORD));
-            camToSrgb = multiply(XYZ65_TO_SRGB, multiply(adapt, camToXyz));
+            camToRgb = multiply(xyz65ToRgb, multiply(adapt, camToXyz));
         } else if (isUsable(forward1)) {
             float[] sensorToReference = invert(cal);
             float[] refNeutral = apply(sensorToReference, neutral);
@@ -214,25 +274,26 @@ final class SensorColorMatrix {
             }
             boolean dualForward = isUsable(forward2) && dualColor;
             float[] forward = dualForward ? mix(forward1, forward2, weight) : forward1;
-            camToSrgb = multiply(XYZ50_TO_SRGB, multiply(forward, sensorToReference));
+            camToRgb = multiply(xyz50ToRgb, multiply(forward, sensorToReference));
         } else {
             throw new IllegalArgumentException("相机缺少可用的传感器色彩矩阵");
         }
 
-        // Guarantee exact neutral gray/white fidelity: camToSrgb * neutral == (1, 1, 1).
-        float[] rowOut = apply(camToSrgb, neutral);
+        // Guarantee neutral fidelity: camToRgb * neutral == targetRgb (1,1,1 when fully adapted).
+        float[] rowOut = apply(camToRgb, neutral);
         for (int r = 0; r < 3; r++) {
             if (rowOut[r] > 1e-4f) {
-                for (int c = 0; c < 3; c++) camToSrgb[3 * r + c] /= rowOut[r];
+                float scaleRow = targetRgb[r] / rowOut[r];
+                for (int c = 0; c < 3; c++) camToRgb[3 * r + c] *= scaleRow;
             }
         }
         float[] wbMatrix = new float[9];
         for (int r = 0; r < 3; r++) {
             for (int c = 0; c < 3; c++) {
-                wbMatrix[3 * r + c] = camToSrgb[3 * r + c] * neutral[c];
+                wbMatrix[3 * r + c] = camToRgb[3 * r + c] * neutral[c];
             }
         }
-        return new Result(camToSrgb, wbMatrix, neutral, cct, duv);
+        return new Result(camToRgb, wbMatrix, neutral, cct, duv);
     }
 
     static float estimateKelvin(float[] rawNeutral, float[] cal1, float[] cal2,
@@ -356,6 +417,11 @@ final class SensorColorMatrix {
         return new float[]{(m[4]*m[8]-m[5]*m[7])/d, (m[2]*m[7]-m[1]*m[8])/d, (m[1]*m[5]-m[2]*m[4])/d,
                 (m[5]*m[6]-m[3]*m[8])/d, (m[0]*m[8]-m[2]*m[6])/d, (m[2]*m[3]-m[0]*m[5])/d,
                 (m[3]*m[7]-m[4]*m[6])/d, (m[1]*m[6]-m[0]*m[7])/d, (m[0]*m[4]-m[1]*m[3])/d};
+    }
+
+    private static float smoothStep(float position) {
+        float t = Math.max(0f, Math.min(1f, position));
+        return t * t * (3f - 2f * t);
     }
 
     private static float kelvin(int exif) {

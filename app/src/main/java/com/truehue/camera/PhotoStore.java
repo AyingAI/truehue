@@ -71,7 +71,8 @@ final class PhotoStore {
                                   float biasEv, int degrees, String suffix, String software,
                                   String description, int focal35mm) throws IOException {
         EditExif edit = exif -> {
-            exif.setAttribute(ExifInterface.TAG_COLOR_SPACE, "1");
+            boolean isP3 = ColorSpace.get(ColorSpace.Named.DISPLAY_P3).equals(bitmap.getColorSpace());
+            exif.setAttribute(ExifInterface.TAG_COLOR_SPACE, isP3 ? "65535" : "1");
             exif.setAttribute(ExifInterface.TAG_ORIENTATION, Integer.toString(orientation(degrees)));
             exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL,
                     new SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.ROOT).format(new Date(takenAt)));
@@ -216,8 +217,8 @@ final class PhotoStore {
                 }
                 String software = exif.getAttribute(ExifInterface.TAG_SOFTWARE);
                 String desc = exif.getAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION);
-                String mode = "TrueHue RAW".equals(software) ? "RAW"
-                        : "TrueHue JPEG".equals(software) ? "JPEG" : "预览";
+                String mode = "TrueHue RAW".equals(software) ? "原彩"
+                        : "TrueHue JPEG".equals(software) ? "高清" : "快拍";
                 String look = lookLabel(desc);
                 return new PhotoMeta(sb.toString(), look, mode, hasGainmap);
             }

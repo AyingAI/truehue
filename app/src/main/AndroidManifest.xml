@@ -12,6 +12,7 @@
         android:theme="@style/CameraTheme">
         <activity
             android:name=".MainActivity"
+            android:colorMode="wideColorGamut"
             android:exported="true"
             android:screenOrientation="portrait">
             <intent-filter>
