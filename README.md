@@ -2,6 +2,8 @@
 
 TrueHue 是一款开源 Android 相机。它通过 Camera2 使用设备开放的后置镜头，在手机本地将 Bayer RAW 显影为 JPEG，可同时保存一份 DNG 底片。
 
+![本色相机 TrueHue 封面，手机取景中是雨后街巷和暖色灯光](assets/truehue-cover.webp)
+
 ## v0.7.0
 
 - **原彩成片**采用 Display P3 广色域，改善暗光彩噪和长焦暗部浮灰。自动白平衡会根据场景保留少量现场光的冷暖。
