@@ -1,44 +1,65 @@
 # 本色相机 · TrueHue
 
-TrueHue 是一款开源 Android 相机。它通过 Camera2 使用设备开放的后置镜头，在手机本地将 Bayer RAW 显影为 JPEG，可同时保存一份 DNG 底片。
+TrueHue 是一款开源 Android 相机，适合拍夜街、室内暖灯和远处的细节。它在手机上处理照片，尽量保留现场光的冷暖和暗部层次。按下快门，就能得到可直接分享的照片。
 
-![本色相机 TrueHue 封面，手机取景中是雨后街巷和暖色灯光](assets/truehue-cover.webp)
+**Android 12 及以上 · 小米 17 三枚后置镜头实测**
 
-## v0.7.0
+[获取与安装](#获取与安装) · [设备支持](#设备支持) · [v0.7.0 更新说明](CHANGELOG.md)
 
-- **原彩成片**采用 Display P3 广色域，改善暗光彩噪和长焦暗部浮灰。自动白平衡会根据场景保留少量现场光的冷暖。
-- **手持拍摄**在多帧合成时自动选锐帧，条件允许时缩短单帧曝光。白天光线充足时可自动切换为单帧原彩直出。
-- **拍摄设置**精简为「拍摄」和「拍照辅助」，底部显示安装版本。亮彩、存底片、九宫格和使用指南在取景页顶部操作。
+![本色相机 TrueHue 封面插画，手机取景中是雨后街巷和暖色灯光](assets/truehue-cover.webp)
 
-[完整更新说明](CHANGELOG.md) · [GitHub 发布页](https://github.com/AyingAI/truehue/releases/tag/v0.7.0)
+## 用它拍什么
 
-## 支持范围
+- **夜街和室内。** 「原彩直出」在自动白平衡时保留一些灯光的冷暖，同时减少暗部彩噪。成片使用 Display P3 广色域。
+- **手持拍长焦。** 支持多帧拍摄的镜头会选较清晰的帧作为参考，再合成降噪。条件允许时会缩短单帧曝光，减少手抖拖影。光线充足时，广角和主摄可自动用单帧抓拍。
+- **给后期留一份底片。** 在「原彩」模式开启顶部「存底片」，拍照时会在 JPEG 旁额外保存一份 DNG，方便以后调整曝光和色彩。
 
-- 最低支持 Android 12（API 31）。是否能访问 RAW 和独立后置镜头，取决于设备通过 Camera2 暴露的能力。RAW 不可用时，应用会尝试原生 JPEG 或取景帧，并在界面显示使用的模式。
-- 小米 17 上验证了 17 mm 超广角、23 mm 主摄和 60 mm 长焦。三枚镜头均可输出 4096 × 3072 RAW，原彩竖拍 JPEG 为 3072 × 4096。
-- 原彩直出使用 Display P3，并在 JPEG 中嵌入 ICC 色彩配置。Android 14（API 34）及以上可开启「亮彩」生成带 Ultra HDR 增益图的 JPEG。支持增益图的相册和显示设备可呈现 HDR，普通相册仍可读取其中的 SDR 图像。
+## 设备支持
 
-## 拍摄
+- **小米 17** 已实测 17 mm 超广角、23 mm 主摄和 60 mm 长焦，原彩竖拍 JPEG 为 3072 × 4096。
+- **其他 Android 12 及以上设备**能使用哪些镜头和「原彩」，取决于厂商开放的 Camera2 能力。镜头无法提供 RAW 时，会尝试使用系统 JPEG「高清直出」或取景帧「极速快拍」。实际模式会显示在取景页。
+- **Android 14 及以上**可在「原彩」模式开启「亮彩」，让支持 Ultra HDR 的相册和屏幕呈现更亮的高光。普通相册也能打开同一张 JPEG。
 
-- 点取景框下方的焦段切换镜头，按钮上标有等效焦距。轻点画面可对焦和测光，长按可锁定。可在取景区上下滑动或使用「亮度」拨盘调整曝光补偿，在「色调」中选择自动、预设或手动色温。
-- 右下角可选原彩、光影、柔光、层次和黑白滤镜。普通取景叠加当前滤镜。想查看 RAW 显影的效果，可在拍摄设置里开启「原彩预览」，刷新会慢一些。
-- 「原彩直出」使用 RAW，可在设备支持时启用多帧对齐降噪和「亮彩」。「极速快拍」保存当前取景帧。
-- 顶部「存底片」可同时保存 DNG。多帧模式下，DNG 保存一张原始 RAW，JPEG 以选出的锐帧为参考进行合成。照片保存在 `DCIM/TrueHue/`。点击左下角缩略图可回看、打开系统相册或分享。
-- 相机首次就绪时会自动打开新手指南，也可从顶部「使用指南」随时查看。在设置中的「拍照辅助」可开启直方图和专业参数。
+## 获取与安装
 
-## 构建和安装
+**v0.7.0 通过源码构建安装。** 在电脑上下载发布页中的 `Source code` 并解压。[前往 v0.7.0 发布页](https://github.com/AyingAI/truehue/releases/tag/v0.7.0)
 
-从发布页下载源码，或用 Git 检出 `v0.7.0`。需要 **JDK 17** 和 Android SDK 中的 **Android Platform 35**、**Build Tools 35.0.0**。真机安装还需要 **Platform Tools**。可通过 Android Studio 的 SDK Manager 安装 SDK，并设置 `ANDROID_HOME`。项目包含 Gradle 8.9 Wrapper，首次构建会下载构建依赖。
-
-macOS 和 Linux 运行以下命令。Windows 使用 `gradlew.bat`。
+1. 安装 JDK 17，并通过 Android Studio 的 SDK Manager 安装 Android Platform 35、Build Tools 35.0.0 和 Platform Tools。将 `ANDROID_HOME` 指向 Android SDK 目录。
+2. 在手机上打开 USB 调试，用数据线连接电脑，并在手机上确认授权。
+3. 在解压后的项目目录运行以下命令。首次构建会下载依赖。
 
 ```sh
-./gradlew :app:assembleDebug :app:lintDebug
+./gradlew :app:installDebug
 ```
 
-调试 APK 位于 `app/build/outputs/apk/debug/app-debug.apk`。启用手机的 USB 调试并授权连接后，运行 `./gradlew :app:installDebug` 即可安装。`./gradlew :app:assembleRelease` 生成未签名 APK，可用自己的 Android 签名密钥签名。覆盖安装需要与手机上现有 APK 使用相同签名。
+Windows 使用 `gradlew.bat :app:installDebug`。覆盖安装时，应用需要使用与手机上已有版本相同的签名。
 
-## 测试
+## 拍第一张照片
+
+1. 打开本色相机并授予相机权限。首次进入取景时会弹出使用指南，也可从顶部重新打开。
+2. 在取景框下方切换镜头。轻点画面对焦、长按锁定，上下滑动调整亮度。想调整冷暖可用「色调」，想换风格可点右下角。
+3. 按下快门，点左下角缩略图即可回看或分享。照片会保存到系统相册的 `DCIM/TrueHue/`。
+
+在「拍摄设置」中可切换「极速快拍」，直接保存取景画面。想提前看原彩显影的效果，可开启「原彩预览」，取景刷新会慢一些。直方图和专业拍摄参数也在这里，应用版本显示在设置底部。
+
+## 隐私
+
+拍照无需账号和网络连接。应用只申请相机权限，取景、显影和保存都在手机上完成。打开相册或分享时，Android 会把所选照片的读取权限交给处理该操作的应用。
+
+JPEG 和 DNG 可能包含拍摄时间、设备型号和曝光参数。系统生成的 JPEG 和 DNG 也可能带有其他相机元数据。TrueHue 不请求定位权限，也不写入 GPS 坐标。
+
+## 开发与测试
+
+<details>
+<summary>展开本地构建和测试命令</summary>
+
+项目包含 Gradle 8.9 Wrapper。以下命令构建调试 APK、运行 Lint，并生成未签名的 Release APK。
+
+```sh
+./gradlew :app:assembleDebug :app:lintDebug :app:assembleRelease
+```
+
+调试 APK 位于 `app/build/outputs/apk/debug/app-debug.apk`。Release APK 可用自己的 Android 签名密钥签名。
 
 纯 Java 检查使用合成像素和镜头标定参数，覆盖 Bayer 插值、白平衡、色彩矩阵、多帧融合、降噪、滤镜、影调及 HDR 增益图。以下命令另在 256 MiB Java 堆下验证 4096 × 3072 显影。快速检查可以省略 `--full`。
 
@@ -61,11 +82,7 @@ adb shell am instrument -w com.truehue.camera.test/com.truehue.camera.LensSmoke
 - 在测试类名前加 `-e exposureOnly true` 可检查高光测光、单帧曝光锁和重建相机会话后的曝光补偿。加 `-e settingsOnly true` 可检查设置、回看和滤镜保存。加 `-e panelsOnly true` 可检查首次启动指南、窄屏顶部按钮和快捷开关。
 - 请保持手机解锁。如果系统拦截后台启动，在测试输出「正在打开本色相机」时从手机上打开应用。
 
-## 隐私
-
-TrueHue 只申请相机权限。取景、显影和编码在手机本地完成，应用没有网络权限、账号、遥测或上传功能。应用将拍摄设置和最近一张照片的引用保存在本地。打开相册或分享时，Android 会将所选照片的读取权限授予处理该操作的应用。
-
-JPEG 和 DNG 可以包含拍摄时间、设备型号和曝光参数。原生 JPEG 和 DNG 可能保留系统相机提供的其他元数据。TrueHue 不请求定位权限，也不写入 GPS 坐标。公开照片前请检查画面和文件元数据。
+</details>
 
 ## 许可证
 
