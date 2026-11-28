@@ -22,6 +22,7 @@ import android.view.ScaleGestureDetector;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
+import android.view.animation.PathInterpolator;
 import android.widget.CompoundButton;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -200,16 +201,27 @@ final class CameraPanels {
         return button;
     }
 
-    /** Pinch-zoomable and double-tap zoomable ImageView for photo review. */
+    /** Pinch-zoomable, swipeable, and double-tap zoomable ImageView for photo review. */
     static final class ZoomableImageView extends ImageView {
+        interface InteractionListener {
+            void onTap();
+            boolean canSwipe(int delta);
+            void onSwipe(int delta);
+            void onSwipeDownDismiss();
+        }
+
+        private static final int MODE_NONE = 0, MODE_PAN = 1, MODE_SWIPE_X = 2, MODE_DISMISS_Y = 3;
+        private static final PathInterpolator EASE_OUT = new PathInterpolator(.16f, 1f, .3f, 1f);
+
         private final Matrix drawMatrix = new Matrix();
-        private final float[] values = new float[9];
         private final ScaleGestureDetector scaleDetector;
         private final GestureDetector gestureDetector;
+        private InteractionListener listener;
         private float baseScale = 1f;
         private float currentScale = 1f;
-        private float lastX, lastY;
-        private boolean dragging;
+        private float downX, downY, lastX, lastY;
+        private int touchMode = MODE_NONE;
+        private boolean dragging, flingHandled;
 
         ZoomableImageView(Context context) {
             super(context);
@@ -221,6 +233,14 @@ final class CameraPanels {
                 }
             });
             gestureDetector = new GestureDetector(context, new GestureDetector.SimpleOnGestureListener() {
+                @Override public boolean onSingleTapConfirmed(MotionEvent e) {
+                    if (listener != null) {
+                        listener.onTap();
+                        return true;
+                    }
+                    return false;
+                }
+
                 @Override public boolean onDoubleTap(MotionEvent e) {
                     if (currentScale > 1.15f) {
                         fitToView();
@@ -229,7 +249,73 @@ final class CameraPanels {
                     }
                     return true;
                 }
+
+                @Override public boolean onFling(MotionEvent e1, MotionEvent e2, float vx, float vy) {
+                    if (listener == null || currentScale > 1.02f || scaleDetector.isInProgress()) return false;
+                    float flingX = dp(450);
+                    float flingY = dp(550);
+                    if (touchMode != MODE_DISMISS_Y
+                            && Math.abs(vx) > Math.abs(vy) * 1.2f && Math.abs(vx) > flingX) {
+                        int delta = vx < 0 ? 1 : -1;
+                        if (listener.canSwipe(delta)) {
+                            flingHandled = true;
+                            resetSwipeOffset(false);
+                            listener.onSwipe(delta);
+                            return true;
+                        }
+                    }
+                    if (touchMode != MODE_SWIPE_X
+                            && vy > flingY && vy > Math.abs(vx) * 1.3f) {
+                        flingHandled = true;
+                        listener.onSwipeDownDismiss();
+                        return true;
+                    }
+                    return false;
+                }
             });
+        }
+
+        void setInteractionListener(InteractionListener listener) {
+            this.listener = listener;
+        }
+
+        void resetTransform() {
+            animate().cancel();
+            setTranslationX(0f);
+            setTranslationY(0f);
+            setScaleX(1f);
+            setScaleY(1f);
+            setAlpha(1f);
+        }
+
+        void playSlideIn(int direction) {
+            if (direction == 0 || !ValueAnimator.areAnimatorsEnabled()) {
+                resetTransform();
+                return;
+            }
+            animate().cancel();
+            setTranslationY(0f);
+            setScaleX(1f);
+            setScaleY(1f);
+            setTranslationX(direction * dp(44));
+            setAlpha(0.55f);
+            animate().translationX(0f).alpha(1f).setDuration(165).setInterpolator(EASE_OUT).start();
+        }
+
+        private float dp(float value) {
+            return value * getResources().getDisplayMetrics().density;
+        }
+
+        private void resetSwipeOffset(boolean animated) {
+            if (!animated || !ValueAnimator.areAnimatorsEnabled()) {
+                setTranslationX(0f);
+                setTranslationY(0f);
+                setScaleX(1f);
+                setScaleY(1f);
+                return;
+            }
+            animate().translationX(0f).translationY(0f).scaleX(1f).scaleY(1f)
+                    .setDuration(150).setInterpolator(EASE_OUT).start();
         }
 
         @Override public void setImageBitmap(Bitmap bm) {
@@ -259,6 +345,7 @@ final class CameraPanels {
         }
 
         private void zoomBy(float factor, float fx, float fy) {
+            resetSwipeOffset(false);
             float target = Math.max(1f, Math.min(5f, currentScale * factor));
             float actual = target / currentScale;
             currentScale = target;
@@ -288,21 +375,75 @@ final class CameraPanels {
             gestureDetector.onTouchEvent(e);
             switch (e.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
-                    lastX = e.getX();
-                    lastY = e.getY();
+                    animate().cancel();
+                    downX = lastX = e.getX();
+                    downY = lastY = e.getY();
+                    touchMode = MODE_NONE;
                     dragging = true;
+                    flingHandled = false;
                     break;
                 case MotionEvent.ACTION_MOVE:
-                    if (dragging && !scaleDetector.isInProgress() && currentScale > 1.02f && e.getPointerCount() == 1) {
+                    if (!dragging || scaleDetector.isInProgress() || e.getPointerCount() != 1) {
+                        lastX = e.getX();
+                        lastY = e.getY();
+                        break;
+                    }
+                    if (currentScale > 1.02f) {
+                        touchMode = MODE_PAN;
                         drawMatrix.postTranslate(e.getX() - lastX, e.getY() - lastY);
                         clampTranslation();
                         setImageMatrix(drawMatrix);
+                    } else {
+                        float dx = e.getX() - downX;
+                        float dy = e.getY() - downY;
+                        float slop = dp(12);
+                        if (touchMode == MODE_NONE) {
+                            if (Math.abs(dx) > slop && Math.abs(dx) > Math.abs(dy) * 1.15f) {
+                                touchMode = MODE_SWIPE_X;
+                            } else if (dy > slop && dy > Math.abs(dx) * 1.35f) {
+                                touchMode = MODE_DISMISS_Y;
+                            }
+                        }
+                        if (touchMode == MODE_SWIPE_X) {
+                            int delta = dx < 0 ? 1 : -1;
+                            boolean canMove = listener != null && listener.canSwipe(delta);
+                            setTranslationX(dx * (canMove ? 0.72f : 0.22f));
+                        } else if (touchMode == MODE_DISMISS_Y) {
+                            float clampedY = Math.max(0f, dy);
+                            setTranslationY(clampedY * 0.60f);
+                            float scale = 1f - Math.min(0.14f, clampedY / Math.max(1f, getHeight()) * 0.25f);
+                            setScaleX(scale);
+                            setScaleY(scale);
+                        }
                     }
                     lastX = e.getX();
                     lastY = e.getY();
                     break;
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL:
+                    if (dragging && !flingHandled && currentScale <= 1.02f) {
+                        float dx = e.getX() - downX;
+                        float dy = e.getY() - downY;
+                        if (e.getActionMasked() == MotionEvent.ACTION_UP && touchMode == MODE_SWIPE_X && listener != null) {
+                            int delta = dx < 0 ? 1 : -1;
+                            float threshold = Math.max(dp(64), getWidth() * 0.20f);
+                            if (Math.abs(dx) > threshold && listener.canSwipe(delta)) {
+                                resetSwipeOffset(false);
+                                listener.onSwipe(delta);
+                                touchMode = MODE_NONE;
+                                dragging = false;
+                                break;
+                            }
+                        } else if (e.getActionMasked() == MotionEvent.ACTION_UP && touchMode == MODE_DISMISS_Y
+                                && listener != null && dy > dp(110)) {
+                            listener.onSwipeDownDismiss();
+                            touchMode = MODE_NONE;
+                            dragging = false;
+                            break;
+                        }
+                        resetSwipeOffset(true);
+                    }
+                    touchMode = MODE_NONE;
                     dragging = false;
                     break;
             }

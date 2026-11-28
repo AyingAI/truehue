@@ -13,6 +13,7 @@ import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
@@ -26,7 +27,6 @@ public final class FrameRenderer implements GLSurfaceView.Renderer {
         void onFrameReady();
         void onHighlightMeter(boolean protect);
         default void onHistogram(float[] bins, float clipFraction) {}
-        void onPhoto(Bitmap bitmap);
         void onRenderError(String message);
     }
 
@@ -50,13 +50,13 @@ public final class FrameRenderer implements GLSurfaceView.Renderer {
             uniform samplerExternalOES cameraImage;
             // grade: (highlights, shadows, desaturation)
             uniform vec3 grade;
-            // look: (vibrance, monochrome)
-            uniform vec2 look;
+            // look: (vibrance, monochrome, masterLook)
+            uniform vec3 look;
             // wbShift: (warmth, tint)
             uniform vec2 wbShift;
             void main() {
               vec3 c = texture2D(cameraImage, uv).rgb;
-              bool hasLook = any(notEqual(grade, vec3(0.0))) || any(notEqual(look, vec2(0.0))) || any(notEqual(wbShift, vec2(0.0)));
+              bool hasLook = any(notEqual(grade, vec3(0.0))) || any(notEqual(look, vec3(0.0))) || any(notEqual(wbShift, vec2(0.0)));
               if (hasLook) {
                 vec3 rgb = mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c));
                 if (any(notEqual(wbShift, vec2(0.0)))) {
@@ -73,22 +73,52 @@ public final class FrameRenderer implements GLSurfaceView.Renderer {
                   rgb = vec3(clamp(m * gain, 0.0, 1.0));
                 } else {
                   float y = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
-                  float light = smoothstep(0.25, 0.82, y);
-                  float shade = smoothstep(0.025, 0.10, y) * (1.0 - smoothstep(0.10, 0.40, y));
-                  float fade = 1.0 - smoothstep(0.86, 1.0, y);
+                  bool isMaster = look.z > 0.5;
+                  float peak0 = max(rgb.r, max(rgb.g, rgb.b));
+                  float light = isMaster ? smoothstep(0.20, 0.76, y) : smoothstep(0.25, 0.82, y);
+                  float shade = isMaster
+                      ? smoothstep(0.015, 0.055, y) * (1.0 - smoothstep(0.075, 0.22, y))
+                      : smoothstep(0.025, 0.10, y) * (1.0 - smoothstep(0.10, 0.40, y));
+                  float fade = isMaster
+                      ? 1.0 - smoothstep(0.68, 0.90, max(y, peak0))
+                      : 1.0 - smoothstep(0.86, 1.0, y);
                   if (grade.z > 0.0) {
                     rgb = mix(rgb, vec3(y), grade.z * light * fade);
                   }
-                  if (look.x > 0.0 && y > 0.02 && y < 0.78) {
+                  float lumBias = 0.0;
+                  float blueDepth = 0.0;
+                  if (isMaster && y > 0.02 && y < 0.92) {
                     float pk = max(rgb.r, max(rgb.g, rgb.b));
                     float mn = min(rgb.r, min(rgb.g, rgb.b));
                     float chroma = pk > 0.0001 ? (pk - mn) / pk : 0.0;
+                    float cMask = smoothstep(0.06, 0.24, chroma) * smoothstep(0.02, 0.10, y) * (1.0 - smoothstep(0.65, 0.92, y));
+                    if (cMask > 0.0) {
+                      vec3 opp = rgb - vec3(y);
+                      vec3 n = opp / (length(opp) + 0.00001);
+                      float blueW = smoothstep(0.35, 0.80, n.b);
+                      float warmW = smoothstep(0.35, 0.80, n.r) * smoothstep(0.15, 0.60, -n.b);
+                      float yGreenW = smoothstep(0.25, 0.70, n.g) * smoothstep(-0.10, 0.35, n.r);
+                      lumBias = (-0.040 * blueW + 0.025 * warmW * (1.0 - smoothstep(0.25, 0.55, y))) * cMask;
+                      blueDepth = 0.08 * blueW * cMask;
+                      if (yGreenW > 0.0) {
+                        float shift = 0.045 * yGreenW * cMask;
+                        rgb.r = max(0.0, rgb.r - shift * max(0.0, rgb.r - rgb.b) * 0.45);
+                        rgb.b = min(1.0, rgb.b + shift * max(0.0, rgb.g - rgb.b) * 0.18);
+                      }
+                    }
+                  }
+                  if ((look.x > 0.0 || blueDepth > 0.0) && y > 0.02 && (isMaster || y < 0.78)) {
+                    float pk = max(rgb.r, max(rgb.g, rgb.b));
+                    float mn = min(rgb.r, min(rgb.g, rgb.b));
+                    float chroma = pk > 0.0001 ? (pk - mn) / pk : 0.0;
+                    float yGate = isMaster ? max(y, pk) : y;
                     float boost = look.x * smoothstep(0.05, 0.25, chroma) * (1.0 - smoothstep(0.55, 0.88, chroma))
-                        * smoothstep(0.02, 0.12, y) * (1.0 - smoothstep(0.48, 0.78, y));
+                        * smoothstep(0.02, 0.12, y) * (1.0 - smoothstep(isMaster ? 0.50 : 0.48, isMaster ? 0.82 : 0.78, yGate))
+                        + blueDepth;
                     rgb = clamp(vec3(y) + (rgb - vec3(y)) * (1.0 + boost), 0.0, 1.0);
                   }
                   float peak = max(rgb.r, max(rgb.g, rgb.b));
-                  float gain = 1.0 + grade.x * light * fade + grade.y * shade;
+                  float gain = 1.0 + grade.x * light * fade + grade.y * shade + lumBias;
                   if (gain > 1.0 && peak > 0.0) gain = min(gain, 1.0 / peak);
                   rgb = clamp(rgb * gain, 0.0, 1.0);
                 }
@@ -272,7 +302,7 @@ public final class FrameRenderer implements GLSurfaceView.Renderer {
     }
 
     /** Queued before latching any subsequent camera buffer, preserving the last rendered frame. */
-    public void shoot(int extraClockwiseDegrees, PhotoFilter selected) {
+    public void shoot(int extraClockwiseDegrees, PhotoFilter selected, Consumer<Bitmap> onPhoto) {
         int epoch = generation.get();
         view.queueEvent(() -> {
             if (generation.get() != epoch) return;
@@ -288,7 +318,7 @@ public final class FrameRenderer implements GLSurfaceView.Renderer {
                 Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
                 bitmap.copyPixelsFromBuffer(pixels);
                 main.post(() -> {
-                    if (generation.get() == epoch) listener.onPhoto(bitmap);
+                    if (generation.get() == epoch) onPhoto.accept(bitmap);
                     else bitmap.recycle();
                 });
             } catch (RuntimeException | OutOfMemoryError e) {
@@ -335,7 +365,7 @@ public final class FrameRenderer implements GLSurfaceView.Renderer {
         glUniform2f(turn, (float) Math.cos(rad), (float) Math.sin(rad));
         glUniform1f(flipY, inverted ? -1f : 1f);
         glUniform3f(grade, selected.highlights, selected.shadows, selected.desaturation);
-        glUniform2f(look, selected.vibrance, selected.monochrome ? 1f : 0f);
+        glUniform3f(look, selected.vibrance, selected.monochrome ? 1f : 0f, selected.masterLook ? 1f : 0f);
         glUniform2f(wbShift, warmth, tint);
         glEnableVertexAttribArray(position);
         glVertexAttribPointer(position, 2, GL_FLOAT, false, 0, quad);

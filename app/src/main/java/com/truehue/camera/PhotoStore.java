@@ -1,8 +1,10 @@
 package com.truehue.camera;
 
 import android.content.ContentResolver;
+import android.content.ContentUris;
 import android.content.ContentValues;
 import android.content.Context;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.ColorSpace;
@@ -18,6 +20,7 @@ import android.os.Build;
 import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
+import android.util.Size;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -29,10 +32,32 @@ import java.nio.channels.Channels;
 import java.nio.channels.WritableByteChannel;
 import java.nio.file.Files;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 
 final class PhotoStore {
+    private static final String ALBUM_DIRECTORY = Environment.DIRECTORY_DCIM + "/TrueHue/";
+    private static final Uri IMAGES = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+
+    static final class PhotoEntry {
+        final Uri uri;
+        final long id;
+        final Long dateTaken;
+        final long takenAt;
+
+        PhotoEntry(Uri uri, Long dateTaken, long takenAt) {
+            this.uri = uri;
+            this.id = ContentUris.parseId(uri);
+            this.dateTaken = dateTaken;
+            this.takenAt = takenAt;
+        }
+    }
+
+    enum DeleteResult { FAILED, DELETED, DNG_REMAINS }
+
     static final class PhotoMeta {
         final String summary;
         final String look;
@@ -178,6 +203,15 @@ final class PhotoStore {
         }, null);
     }
 
+    static Uri saveDng(Context context, RawRenderer.RawSnapshot raw, long time) throws IOException {
+        return publish(context, time, ".dng", stream -> {
+            try (DngCreator dng = new DngCreator(raw.sensor, raw.shot)) {
+                dng.setOrientation(orientation(raw.clockwiseDegrees));
+                dng.writeByteBuffer(stream, raw.size, ByteBuffer.wrap(raw.pixels), 0);
+            }
+        }, null);
+    }
+
     static PhotoMeta readMeta(Context context, Uri uri) {
         try (InputStream in = context.getContentResolver().openInputStream(uri)) {
             if (in == null) return null;
@@ -251,10 +285,10 @@ final class PhotoStore {
         values.put(MediaStore.Images.Media.DISPLAY_NAME, base + suffix);
         values.put(MediaStore.Images.Media.MIME_TYPE, suffix.equals(".dng") ? "image/x-adobe-dng" : "image/jpeg");
         values.put(MediaStore.Images.Media.DATE_TAKEN, takenAt);
-        values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/TrueHue");
+        values.put(MediaStore.Images.Media.RELATIVE_PATH, ALBUM_DIRECTORY);
         values.put(MediaStore.Images.Media.IS_PENDING, 1);
         ContentResolver resolver = context.getContentResolver();
-        Uri uri = resolver.insert(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values);
+        Uri uri = resolver.insert(IMAGES, values);
         if (uri == null) throw new IOException("无法创建照片");
         boolean published = false;
         try {
@@ -288,5 +322,108 @@ final class PhotoStore {
             float scale = Math.min(1f, (float) maxEdge / Math.max(width, height));
             decoder.setTargetSize(Math.max(1, Math.round(width * scale)), Math.max(1, Math.round(height * scale)));
         });
+    }
+
+    static Bitmap readThumbnail(Context context, Uri uri, int sizePx) throws IOException {
+        try {
+            return context.getContentResolver().loadThumbnail(uri, new Size(sizePx, sizePx), null);
+        } catch (IOException | RuntimeException ignored) {
+            return read(context, uri, sizePx);
+        }
+    }
+
+    static List<PhotoEntry> listPhotos(Context context, int limit) {
+        return listPhotos(context, limit, null);
+    }
+
+    static List<PhotoEntry> listPhotos(Context context, int limit, PhotoEntry before) {
+        List<PhotoEntry> out = new ArrayList<>();
+        if (limit <= 0) return out;
+        String id = MediaStore.Images.Media._ID;
+        String dateTaken = MediaStore.Images.Media.DATE_TAKEN;
+        String[] projection = {id, dateTaken, MediaStore.Images.Media.DATE_ADDED};
+        String selection = MediaStore.Images.Media.RELATIVE_PATH + " = ? AND "
+                + MediaStore.Images.Media.MIME_TYPE + " = ? AND "
+                + MediaStore.Images.Media.IS_PENDING + " = 0 AND "
+                + MediaStore.Images.Media.IS_TRASHED + " = 0";
+        String[] args = {ALBUM_DIRECTORY, "image/jpeg"};
+        if (before != null) {
+            String beforeId = Long.toString(before.id);
+            if (before.dateTaken == null) {
+                selection += " AND " + dateTaken + " IS NULL AND " + id + " < ?";
+                args = new String[]{ALBUM_DIRECTORY, "image/jpeg", beforeId};
+            } else {
+                selection += " AND (" + dateTaken + " < ? OR (" + dateTaken + " = ? AND "
+                        + id + " < ?) OR " + dateTaken + " IS NULL)";
+                String beforeDate = before.dateTaken.toString();
+                args = new String[]{ALBUM_DIRECTORY, "image/jpeg", beforeDate, beforeDate, beforeId};
+            }
+        }
+        String sort = dateTaken + " DESC, " + id + " DESC";
+        try (Cursor cursor = context.getContentResolver().query(IMAGES, projection, selection, args, sort)) {
+            if (cursor == null) return out;
+            while (out.size() < limit && cursor.moveToNext()) {
+                Long taken = cursor.isNull(1) ? null : cursor.getLong(1);
+                long takenAt = taken != null && taken > 0 ? taken : cursor.getLong(2) * 1000L;
+                out.add(new PhotoEntry(ContentUris.withAppendedId(IMAGES, cursor.getLong(0)), taken, takenAt));
+            }
+        } catch (RuntimeException ignored) {
+            return out;
+        }
+        return out;
+    }
+
+    static DeleteResult deletePhoto(Context context, Uri uri) {
+        ContentResolver resolver = context.getContentResolver();
+        String path = MediaStore.Images.Media.RELATIVE_PATH;
+        String name = MediaStore.Images.Media.DISPLAY_NAME;
+        String displayName;
+        try (Cursor cursor = resolver.query(uri, new String[]{path, name}, null, null, null)) {
+            if (cursor == null || !cursor.moveToFirst() || !ALBUM_DIRECTORY.equals(cursor.getString(0))) {
+                return DeleteResult.FAILED;
+            }
+            displayName = cursor.getString(1);
+        } catch (RuntimeException ex) {
+            return DeleteResult.FAILED;
+        }
+
+        try {
+            if (resolver.delete(uri, path + " = ?", new String[]{ALBUM_DIRECTORY}) == 0) {
+                return DeleteResult.FAILED;
+            }
+        } catch (RuntimeException ex) {
+            return DeleteResult.FAILED;
+        }
+
+        if (displayName == null || !displayName.toLowerCase(Locale.ROOT).endsWith(".jpg")) {
+            return DeleteResult.DELETED;
+        }
+        String dngName = displayName.substring(0, displayName.length() - 4) + ".dng";
+        String selection = path + " = ? AND " + name + " = ?";
+        String[] args = {ALBUM_DIRECTORY, dngName};
+        try (Cursor cursor = resolver.query(IMAGES, new String[]{MediaStore.Images.Media._ID}, selection, args, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                Uri dng = ContentUris.withAppendedId(IMAGES, cursor.getLong(0));
+                if (resolver.delete(dng, selection, args) == 0) return DeleteResult.DNG_REMAINS;
+            }
+        } catch (RuntimeException ex) {
+            return DeleteResult.DNG_REMAINS;
+        }
+        return DeleteResult.DELETED;
+    }
+
+    static String formatTakenTime(long takenAt) {
+        if (takenAt <= 0) return "";
+        Calendar now = Calendar.getInstance();
+        Calendar shot = Calendar.getInstance();
+        shot.setTimeInMillis(takenAt);
+        String hm = new SimpleDateFormat("HH:mm", Locale.ROOT).format(new Date(takenAt));
+        if (now.get(Calendar.YEAR) == shot.get(Calendar.YEAR)) {
+            int dayDiff = now.get(Calendar.DAY_OF_YEAR) - shot.get(Calendar.DAY_OF_YEAR);
+            if (dayDiff == 0) return "今天 " + hm;
+            if (dayDiff == 1) return "昨天 " + hm;
+            return (shot.get(Calendar.MONTH) + 1) + "月" + shot.get(Calendar.DAY_OF_MONTH) + "日 " + hm;
+        }
+        return new SimpleDateFormat("yyyy年M月d日", Locale.ROOT).format(new Date(takenAt));
     }
 }

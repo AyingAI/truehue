@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.app.Instrumentation;
 import android.content.ContentResolver;
 import android.content.ContentUris;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -12,6 +13,7 @@ import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.ColorSpace;
+import android.graphics.ImageFormat;
 import android.graphics.Rect;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CaptureResult;
@@ -27,16 +29,23 @@ import android.view.ViewGroup;
 import android.view.inspector.WindowInspector;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.GridView;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.DataInputStream;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.CountDownLatch;
@@ -62,13 +71,14 @@ public final class LensSmoke extends Instrumentation {
         boolean paired = Boolean.parseBoolean(args.getString("compare", "false"));
         boolean exposureOnly = Boolean.parseBoolean(args.getString("exposureOnly", "false"));
         boolean panelsOnly = Boolean.parseBoolean(args.getString("panelsOnly", "false"));
+        boolean regressionsOnly = Boolean.parseBoolean(args.getString("regressionsOnly", "false"));
         Bundle out = new Bundle();
         int code = Activity.RESULT_OK;
         MainActivity activity = null;
         try {
-            prefs.edit().putBoolean("sameFrame", false).putBoolean("liveRaw", !exposureOnly && !panelsOnly)
-                    .putBoolean("multiFrame", true).putBoolean("ultraHdr", android.os.Build.VERSION.SDK_INT >= 34)
-                    .putBoolean("keepDng", includeDng).putBoolean("guideShown", !panelsOnly)
+            prefs.edit().putBoolean("sameFrame", false).putBoolean("liveRaw", !exposureOnly && !panelsOnly && !regressionsOnly)
+                    .putBoolean("multiFrame", !regressionsOnly).putBoolean("ultraHdr", android.os.Build.VERSION.SDK_INT >= 34)
+                    .putBoolean("keepDng", includeDng && !regressionsOnly).putBoolean("guideShown", !panelsOnly)
                     .putString("photoFilter", PhotoFilter.ORIGINAL.id).commit();
             Intent open = new Intent(target, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             ActivityMonitor monitor = addMonitor(MainActivity.class.getName(), null, false);
@@ -83,7 +93,10 @@ public final class LensSmoke extends Instrumentation {
                 comparison.setBoolean(launched, true);
             }
             CameraScreen ui = onUi(() -> (CameraScreen) ((ViewGroup) launched.findViewById(android.R.id.content)).getChildAt(0));
-            if (exposureOnly) {
+            if (regressionsOnly) {
+                verifyReleaseRegressions(launched, ui);
+                out.putString("result", "Capture ownership, album paging and deletion, and DNG recovery passed.");
+            } else if (exposureOnly) {
                 await("主摄测光就绪", () -> onUi(() -> ui.shutter.isEnabled()), ui);
                 verifyExposureControl(launched, ui);
                 out.putString("result", "Exposure metering passed.");
@@ -114,8 +127,210 @@ public final class LensSmoke extends Instrumentation {
             }
             if (before.containsKey("photoFilter")) edit.putString("photoFilter", (String) before.get("photoFilter"));
             else edit.remove("photoFilter");
+            if (regressionsOnly) {
+                edit.putString("last", (String) before.get("last"));
+                if (before.containsKey("lastTime")) edit.putLong("lastTime", (Long) before.get("lastTime"));
+                else edit.remove("lastTime");
+            }
             edit.commit();
             finish(code, out);
+        }
+    }
+
+    private void verifyReleaseRegressions(MainActivity activity, CameraScreen ui) throws Exception {
+        ContentResolver resolver = activity.getContentResolver();
+        List<Uri> fixtures = new ArrayList<>();
+        Bitmap tile = Bitmap.createBitmap(16, 12, Bitmap.Config.ARGB_8888);
+        PhotoViewer viewer = null;
+        try {
+            long date = System.currentTimeMillis() + TimeUnit.DAYS.toMillis(1);
+            for (int i = 0; i < 205; i++) {
+                // Keep identical timestamps across page boundaries to exercise the MediaStore ID tie-breaker.
+                fixtures.add(insertFixture(resolver, tile, "DCIM/TrueHue/", "TH_test_" + date + "_" + i + ".jpg", date));
+            }
+            Uri oldest = fixtures.get(0);
+            String dngName = "TH_test_" + date + "_0.dng";
+            Uri negative = insertFixture(resolver, null, "DCIM/TrueHue/", dngName, date);
+            fixtures.add(negative);
+            Uri backup = insertFixture(resolver, null, "DCIM/TrueHue/Archive/", dngName, date);
+            fixtures.add(backup);
+            sendLine("分页与相册操作");
+            Uri first = PhotoStore.listPhotos(activity, 1).get(0).uri;
+            viewer = onUi(() -> PhotoViewer.open(activity, ui, first, false, new PhotoViewer.Host() {
+                @Override public void onShare(Uri uri) { throw new AssertionError("加载期间触发了分享"); }
+                @Override public void onOpenInGallery(Uri uri) { throw new AssertionError("加载期间打开了系统相册"); }
+                @Override public void onLibraryChanged(Uri uri, long takenAt) {}
+                @Override public void onPhotoDeleted(Uri uri) {}
+                @Override public void onDismiss() {}
+            }));
+            PhotoViewer album = viewer;
+            await("首屏照片", () -> onUi(() -> first.equals(field(album, "displayedUri")) && albumSize(album) >= 60), ui);
+            onUi(() -> {
+                invoke(album, "showIndex", new Class<?>[]{int.class, int.class}, 5, 0);
+                if (field(album, "displayedUri") != null
+                        || ((TextView) field(album, "shareButton")).isEnabled()
+                        || ((TextView) field(album, "deleteButton")).isEnabled()) {
+                    throw new AssertionError("切图加载中仍可操作照片");
+                }
+                invoke(album, "setGridVisible", new Class<?>[]{boolean.class}, true);
+                return null;
+            });
+            for (int i = 0; i < 5 && !onUi(() -> albumContains(album, oldest)); i++) {
+                int count = onUi(() -> {
+                    int size = albumSize(album);
+                    ((GridView) field(album, "gridView")).setSelection(size - 1);
+                    return size;
+                });
+                await("继续加载相册照片", () -> onUi(() -> albumSize(album) > count || albumContains(album, oldest)), ui);
+            }
+            if (!onUi(() -> albumSize(album) > 200 && albumContains(album, oldest))) {
+                throw new AssertionError("相册无法浏览第 200 张之后的照片");
+            }
+            if (PhotoStore.deletePhoto(activity, oldest) != PhotoStore.DeleteResult.DELETED
+                    || mediaExists(resolver, oldest) || mediaExists(resolver, negative) || !mediaExists(resolver, backup)) {
+                throw new AssertionError("删除操作未正确处理同名底片");
+            }
+            fixtures.remove(oldest);
+            fixtures.remove(negative);
+            onUi(() -> { album.dismiss(); return null; });
+
+            sendLine("快门状态和后台取消");
+            await("快门就绪", () -> onUi(ui.shutter::isEnabled), ui);
+            Object firstCapture = onUi(() -> {
+                setField(activity, "proofInFlight", true);
+                ui.shutter.performClick();
+                Object capture = field(activity, "activeCapture");
+                invoke(activity, "handOffCapture", new Class<?>[]{capture.getClass(), String.class}, capture, null);
+                ui.shutter.performClick();
+                invoke(activity, "photoSaved", new Class<?>[]{Uri.class, String.class, capture.getClass()},
+                        first, "测试保存完成", capture);
+                return capture;
+            });
+            onUi(() -> {
+                invoke(activity, "actionFailed", new Class<?>[]{firstCapture.getClass(), String.class},
+                        firstCapture, "重复回调");
+                if (ui.shutter.isEnabled() || !Integer.valueOf(1).equals(field(activity, "pendingSaves"))) {
+                    throw new AssertionError("上一张照片的回调改变了当前快门状态");
+                }
+                invoke(activity, "stopPreview", new Class<?>[0]);
+                if (!Integer.valueOf(0).equals(field(activity, "pendingSaves"))) {
+                    throw new AssertionError("等待原彩预览时取消拍摄留下了保存任务");
+                }
+                invoke(activity, "begin", new Class<?>[0]);
+                return null;
+            });
+            await("恢复取景", () -> onUi(ui.shutter::isEnabled), ui);
+            onUi(() -> {
+                setField(activity, "sameFrame", true);
+                ui.shutter.performClick();
+                invoke(activity, "stopPreview", new Class<?>[0]);
+                setField(activity, "sameFrame", false);
+                if (!Integer.valueOf(0).equals(field(activity, "pendingSaves"))) {
+                    throw new AssertionError("取景器关闭时快拍留下了保存任务");
+                }
+                invoke(activity, "begin", new Class<?>[0]);
+                return null;
+            });
+
+            sendLine("单帧 RAW 显影失败恢复 DNG");
+            await("RAW 就绪", () -> onUi(() -> ui.shutter.isEnabled()
+                    && Integer.valueOf(ImageFormat.RAW_SENSOR).equals(field(activity, "stillFormat"))), ui);
+            long stamp = onUi(() -> {
+                Object originalFilter = field(activity, "filter");
+                setField(activity, "filter", null); // Force the developer to fail after RAW extraction.
+                ui.shutter.performClick();
+                setField(activity, "filter", originalFilter);
+                return (long) field(field(activity, "lastCapture"), "stamp");
+            });
+            await("DNG 恢复", () -> onUi(() -> ui.status.getText().toString().contains("已保存原始底片")), ui);
+            Uri collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+            String dngFile = new SimpleDateFormat("'TH_'yyyyMMdd_HHmmss_SSS'.dng'", Locale.ROOT)
+                    .format(new Date(stamp));
+            try (Cursor cursor = resolver.query(collection, new String[]{"_id"},
+                    "relative_path = ? AND _display_name = ?",
+                    new String[]{"DCIM/TrueHue/", dngFile}, null)) {
+                if (cursor == null || !cursor.moveToFirst()) throw new AssertionError("缺少恢复底片");
+                Uri recovered = ContentUris.withAppendedId(collection, cursor.getLong(0));
+                fixtures.add(recovered);
+                try (DataInputStream in = new DataInputStream(resolver.openInputStream(recovered))) {
+                    verifyRawDirectory(in);
+                }
+            }
+        } finally {
+            PhotoViewer album = viewer;
+            if (album != null) onUi(() -> { album.dismiss(); return null; });
+            tile.recycle();
+            for (Uri uri : fixtures) {
+                if (mediaExists(resolver, uri)) resolver.delete(uri, null, null);
+            }
+        }
+    }
+
+    private static Uri insertFixture(ContentResolver resolver, Bitmap jpeg, String path, String name, long date)
+            throws Exception {
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.Images.Media.RELATIVE_PATH, path);
+        values.put(MediaStore.Images.Media.DISPLAY_NAME, name);
+        values.put(MediaStore.Images.Media.MIME_TYPE, jpeg == null ? "image/x-adobe-dng" : "image/jpeg");
+        values.put(MediaStore.Images.Media.DATE_TAKEN, date);
+        values.put(MediaStore.Images.Media.IS_PENDING, 1);
+        Uri uri = resolver.insert(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values);
+        try {
+            try (OutputStream stream = resolver.openOutputStream(uri)) {
+                if (jpeg == null) stream.write(0);
+                else if (!jpeg.compress(Bitmap.CompressFormat.JPEG, 85, stream)) throw new AssertionError("测试图写入失败");
+            }
+            values.clear();
+            values.put(MediaStore.Images.Media.IS_PENDING, 0);
+            if (resolver.update(uri, values, null, null) != 1) throw new AssertionError("测试图发布失败");
+            return uri;
+        } catch (Exception | AssertionError ex) {
+            resolver.delete(uri, null, null);
+            throw ex;
+        }
+    }
+
+    private static boolean mediaExists(ContentResolver resolver, Uri uri) {
+        try (Cursor cursor = resolver.query(uri, new String[]{"_id"}, null, null, null)) {
+            return cursor != null && cursor.moveToFirst();
+        }
+    }
+
+    private static int albumSize(PhotoViewer album) {
+        return ((List<?>) field(album, "photos")).size();
+    }
+
+    private static boolean albumContains(PhotoViewer album, Uri uri) {
+        return (int) invoke(album, "indexOfUri", new Class<?>[]{Uri.class}, uri) >= 0;
+    }
+
+    private static Object field(Object target, String name) {
+        try {
+            var field = target.getClass().getDeclaredField(name);
+            field.setAccessible(true);
+            return field.get(target);
+        } catch (ReflectiveOperationException ex) {
+            throw new AssertionError(ex);
+        }
+    }
+
+    private static void setField(Object target, String name, Object value) {
+        try {
+            var field = target.getClass().getDeclaredField(name);
+            field.setAccessible(true);
+            field.set(target, value);
+        } catch (ReflectiveOperationException ex) {
+            throw new AssertionError(ex);
+        }
+    }
+
+    private static Object invoke(Object target, String name, Class<?>[] types, Object... arguments) {
+        try {
+            var method = target.getClass().getDeclaredMethod(name, types);
+            method.setAccessible(true);
+            return method.invoke(target, arguments);
+        } catch (ReflectiveOperationException ex) {
+            throw new AssertionError(ex);
         }
     }
 

@@ -198,8 +198,8 @@ final class SensorColorMatrix {
                             vFixed = uv0[1] - 0.0015f + 0.25f * (duv + 0.0015f);
                             uFixed = uv[0] + 0.30f * (uv0[0] - uv[0]);
                             adjust = true;
-                        } else if (duv > 0.0045f) {
-                            vFixed = uv0[1] + 0.0045f + 0.35f * (duv - 0.0045f);
+                        } else if (duv > 0.0030f) {
+                            vFixed = uv0[1] + 0.0030f + 0.35f * (duv - 0.0030f);
                             uFixed = uv[0] + 0.30f * (uv0[0] - uv[0]);
                             adjust = true;
                         }

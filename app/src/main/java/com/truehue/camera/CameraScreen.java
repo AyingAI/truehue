@@ -61,8 +61,9 @@ final class CameraScreen extends LinearLayout {
 
     private final LinearLayout lensRow, filterTray, evTray, wbTray;
     private final Mark galleryMark;
+    private final GalleryRing galleryRing;
     private final View curtain, exposureBlink;
-    private boolean hasLenses, proInfoVisible;
+    private boolean hasLenses, proInfoVisible, galleryHasPhoto, galleryProcessing;
     private int activeTray = TRAY_LENS;
     private float aspect = 0.75f;
 
@@ -341,8 +342,11 @@ final class CameraScreen extends LinearLayout {
         thumbnail.setScaleType(ImageView.ScaleType.CENTER_CROP);
         thumbnail.setVisibility(GONE);
         gallery.addView(thumbnail, new FrameLayout.LayoutParams(-1, -1));
-        gallery.setContentDescription("查看上张照片");
-        gallery.setTooltipText("上张照片");
+        galleryRing = new GalleryRing(context);
+        galleryRing.setVisibility(GONE);
+        gallery.addView(galleryRing, new FrameLayout.LayoutParams(-1, -1));
+        gallery.setContentDescription("查看本色相册");
+        gallery.setTooltipText("本色相册");
         gallery.setFocusable(true);
         TextView galleryCaption = label("相册", 10, MUTED);
         galleryCaption.setOnClickListener(v -> gallery.performClick());
@@ -675,21 +679,39 @@ final class CameraScreen extends LinearLayout {
     }
 
     void showThumbnail(Bitmap image, boolean animate) {
+        galleryHasPhoto = image != null;
         thumbnail.animate().cancel();
         thumbnail.setImageBitmap(image);
-        thumbnail.setVisibility(image == null ? GONE : VISIBLE);
-        galleryMark.setVisibility(image == null ? VISIBLE : GONE);
-        gallery.setAlpha(image == null ? 0.5f : 1f);
-        gallery.setEnabled(image != null);
+        thumbnail.setVisibility(galleryHasPhoto ? VISIBLE : GONE);
+        galleryMark.setVisibility(galleryHasPhoto ? GONE : VISIBLE);
+        updateGalleryInteractiveState();
         thumbnail.setAlpha(1f);
         thumbnail.setScaleX(1f);
         thumbnail.setScaleY(1f);
-        if (image != null && animate && ValueAnimator.areAnimatorsEnabled()) {
+        if (galleryHasPhoto && animate && ValueAnimator.areAnimatorsEnabled()) {
             thumbnail.setAlpha(.54f);
             thumbnail.setScaleX(.90f);
             thumbnail.setScaleY(.90f);
             thumbnail.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(210).setInterpolator(EASE_OUT).start();
         }
+    }
+
+    void setGalleryProcessing(boolean processing) {
+        if (galleryProcessing == processing) return;
+        galleryProcessing = processing;
+        galleryRing.setActive(processing);
+        updateGalleryInteractiveState();
+    }
+
+    void setGalleryHasPhoto(boolean hasPhoto) {
+        galleryHasPhoto = hasPhoto;
+        updateGalleryInteractiveState();
+    }
+
+    private void updateGalleryInteractiveState() {
+        boolean interactive = galleryHasPhoto || galleryProcessing;
+        gallery.setEnabled(interactive);
+        gallery.setAlpha(interactive ? 1f : 0.5f);
     }
 
     private LinearLayout column() {
@@ -1106,7 +1128,7 @@ final class CameraScreen extends LinearLayout {
     }
 
     static final class Mark extends View {
-        static final int SHUTTER = 0, FILTER = 1, GALLERY = 2, SETTINGS = 3, BACK = 4, GRID = 5, SHARE = 6, HELP = 7;
+        static final int SHUTTER = 0, FILTER = 1, GALLERY = 2, SETTINGS = 3, BACK = 4, GRID = 5, SHARE = 6, HELP = 7, DELETE = 8, ALBUM_GRID = 9;
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final RectF arcBounds = new RectF();
         private final int kind;
@@ -1231,9 +1253,88 @@ final class CameraScreen extends LinearLayout {
                     paint.setStyle(Paint.Style.FILL);
                     canvas.drawCircle(24, 30.6f, 1.15f, paint);
                     break;
+                case DELETE:
+                    paint.setStrokeWidth(1.65f);
+                    canvas.drawLine(14, 17, 34, 17, paint);
+                    canvas.drawLine(20.5f, 14, 27.5f, 14, paint);
+                    canvas.drawLine(20.5f, 14, 20.5f, 17, paint);
+                    canvas.drawLine(27.5f, 14, 27.5f, 17, paint);
+                    canvas.drawLine(17, 17, 18.5f, 34, paint);
+                    canvas.drawLine(18.5f, 34, 29.5f, 34, paint);
+                    canvas.drawLine(29.5f, 34, 31, 17, paint);
+                    canvas.drawLine(22, 21.5f, 22.3f, 29.5f, paint);
+                    canvas.drawLine(26, 21.5f, 25.7f, 29.5f, paint);
+                    break;
+                case ALBUM_GRID:
+                    paint.setStrokeWidth(1.65f);
+                    canvas.drawRoundRect(13, 13, 22, 22, 2.5f, 2.5f, paint);
+                    canvas.drawRoundRect(26, 13, 35, 22, 2.5f, 2.5f, paint);
+                    canvas.drawRoundRect(13, 26, 22, 35, 2.5f, 2.5f, paint);
+                    canvas.drawRoundRect(26, 26, 35, 35, 2.5f, 2.5f, paint);
+                    break;
                 default: break;
             }
             canvas.restore();
+        }
+    }
+
+    private final class GalleryRing extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF arc = new RectF();
+        private ValueAnimator anim;
+        private float angle;
+        private boolean active;
+
+        GalleryRing(Context context) { super(context); }
+
+        void setActive(boolean active) {
+            if (this.active == active) return;
+            this.active = active;
+            setVisibility(active ? VISIBLE : GONE);
+            if (anim != null) {
+                anim.cancel();
+                anim = null;
+            }
+            if (active && ValueAnimator.areAnimatorsEnabled()) {
+                anim = ValueAnimator.ofFloat(0f, 360f);
+                anim.setDuration(880);
+                anim.setRepeatCount(ValueAnimator.INFINITE);
+                anim.setInterpolator(new LinearInterpolator());
+                anim.addUpdateListener(a -> {
+                    angle = (float) a.getAnimatedValue();
+                    invalidate();
+                });
+                anim.start();
+            } else {
+                invalidate();
+            }
+        }
+
+        @Override protected void onDetachedFromWindow() {
+            if (anim != null) {
+                anim.cancel();
+                anim = null;
+            }
+            super.onDetachedFromWindow();
+        }
+
+        @Override protected void onDraw(Canvas canvas) {
+            if (!active) return;
+            int w = getWidth(), h = getHeight();
+            if (w <= 0 || h <= 0) return;
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(0x6609090a);
+            canvas.drawRect(0, 0, w, h, paint);
+
+            float cx = w * 0.5f, cy = h * 0.5f, r = dp(10.5f);
+            arc.set(cx - r, cy - r, cx + r, cy + r);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(dp(2));
+            paint.setStrokeCap(Paint.Cap.ROUND);
+            paint.setColor(0x44ffffff);
+            canvas.drawCircle(cx, cy, r, paint);
+            paint.setColor(ACCENT);
+            canvas.drawArc(arc, angle, 110f, false, paint);
         }
     }
 }

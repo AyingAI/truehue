@@ -52,7 +52,9 @@ final class StillStream {
         void onFailure(String message);
     }
 
-    private static final ExecutorService DEVELOPMENT = Executors.newSingleThreadExecutor(
+    static final ExecutorService EXTRACT = Executors.newSingleThreadExecutor(
+            job -> new Thread(job, "TrueHue-Extract"));
+    static final ExecutorService DEVELOPMENT = Executors.newSingleThreadExecutor(
             job -> new Thread(job, "TrueHue-Develop"));
     private final Handler worker, main;
     private final ImageReader reader;
@@ -307,7 +309,7 @@ final class StillStream {
         worker.removeCallbacks(shot.timeout);
         pending = null;
         processing = true;
-        DEVELOPMENT.execute(() -> {
+        EXTRACT.execute(() -> {
             try (Image image = shot.image) {
                 shot.callback.onImage(image, info, shot.result, shot.degrees);
             } catch (Exception | OutOfMemoryError e) {

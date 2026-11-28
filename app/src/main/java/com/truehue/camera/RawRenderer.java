@@ -19,6 +19,7 @@ import android.util.Rational;
 import android.util.Size;
 
 import java.nio.ByteBuffer;
+import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.ShortBuffer;
 
@@ -53,6 +54,26 @@ final class RawRenderer {
             this.white = white;
             this.crop = crop;
             this.stride = stride;
+        }
+    }
+
+    /** Extracted active Bayer pixel buffer decoupled from the Camera2 Image lifecycle. */
+    static final class RawSnapshot {
+        final byte[] pixels;
+        final Size size;
+        final RawGeometry geometry;
+        final CameraCharacteristics sensor;
+        final TotalCaptureResult shot;
+        final int clockwiseDegrees;
+
+        RawSnapshot(byte[] pixels, Size size, RawGeometry geometry,
+                    CameraCharacteristics sensor, TotalCaptureResult shot, int clockwiseDegrees) {
+            this.pixels = pixels;
+            this.size = size;
+            this.geometry = geometry;
+            this.sensor = sensor;
+            this.shot = shot;
+            this.clockwiseDegrees = clockwiseDegrees;
         }
     }
 
@@ -97,6 +118,38 @@ final class RawRenderer {
                 merged.black12, merged.white12, cal.balance, cal.transform,
                 shade.map, shade.columns, shade.rows);
         return bitmap(pipe, clockwiseDegrees, options, sensor, shot, merged.effectiveFrames, sceneEv);
+    }
+
+    static RawSnapshot extractSnapshot(Image raw, CameraCharacteristics sensor, TotalCaptureResult shot,
+                                       int clockwiseDegrees) {
+        RawGeometry geo = inspectRaw(raw, sensor, shot);
+        int width = raw.getWidth(), height = raw.getHeight();
+        int rowBytes = Math.multiplyExact(width, Short.BYTES);
+        int strideBytes = geo.stride * Short.BYTES;
+        ByteBuffer data = raw.getPlanes()[0].getBuffer().slice();
+        byte[] pixels = new byte[Math.multiplyExact(rowBytes, height)];
+        // DngCreator needs the full sensor frame with padding removed.
+        if (strideBytes == rowBytes) {
+            data.get(pixels);
+        } else {
+            for (int y = 0; y < height; y++) {
+                data.position(y * strideBytes);
+                data.get(pixels, y * rowBytes, rowBytes);
+            }
+        }
+        return new RawSnapshot(pixels, new Size(width, height), geo, sensor, shot, clockwiseDegrees);
+    }
+
+    static Bitmap renderSnapshot(RawSnapshot snap, Options options) {
+        float sceneEv = computeSceneEv(snap.shot);
+        ColorCalibration cal = calibrateColor(snap.sensor, snap.shot, options, sceneEv);
+        ShadingInfo shade = readShading(snap.shot);
+        RawGeometry geo = snap.geometry;
+        ShortBuffer bayer = ByteBuffer.wrap(snap.pixels).order(ByteOrder.nativeOrder()).asShortBuffer();
+        BayerPipeline pipe = new BayerPipeline(bayer, snap.size.getWidth(), geo.crop.left, geo.crop.top,
+                geo.crop.width(), geo.crop.height(), geo.channel, geo.black, geo.white,
+                cal.balance, cal.transform, shade.map, shade.columns, shade.rows);
+        return bitmap(pipe, snap.clockwiseDegrees, options, snap.sensor, snap.shot, 1f, sceneEv);
     }
 
     static RawGeometry inspectRaw(Image raw, CameraCharacteristics sensor, TotalCaptureResult shot) {
@@ -365,7 +418,7 @@ final class RawRenderer {
             } else if (Float.isFinite(options.fallbackMeteredBiasEv)) {
                 ev = options.fallbackMeteredBiasEv;
             }
-            if (ev < 0) exposure *= (float) Math.pow(2, 0.8 * Math.min(1f, -ev));
+            if (ev < 0) exposure *= (float) Math.pow(2, 0.95 * Math.min(1f, -ev));
         }
         for (int i = 0; i < transform.length; i++) transform[i] *= exposure;
         return new ColorCalibration(balance, transform);

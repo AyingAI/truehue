@@ -46,6 +46,7 @@ import android.window.OnBackInvokedDispatcher;
 import java.io.IOException;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -65,6 +66,8 @@ public final class MainActivity extends Activity implements SensorEventListener 
     private boolean hasGravity;
 
     private Uri lastPhoto;
+    private int lastPhotoLoadGeneration;
+    private PhotoViewer activeViewer;
     private int run, deviceRotation;
     private int stillFormat, stillWidth, stillHeight, previewWidth, previewHeight;
     private int currentLensMm;
@@ -79,13 +82,32 @@ public final class MainActivity extends Activity implements SensorEventListener 
     private float userEvBias, manualKelvin, manualTint;
     private boolean highlightProtecting, showingTransientStatus;
     private CameraInput.Telemetry latestTelemetry;
-    private boolean foreground, ready, busy;
-    private long shutterTime;
+    private boolean foreground, ready;
+    private int pendingSaves;
+    private Capture activeCapture, lastCapture;
+
+    private static final class Capture {
+        final long stamp = System.currentTimeMillis();
+        final int session, format, lensMm;
+        final PhotoFilter filter;
+        boolean finished;
+
+        Capture(int session, int format, int lensMm, PhotoFilter filter) {
+            this.session = session;
+            this.format = format;
+            this.lensMm = lensMm;
+            this.filter = filter;
+        }
+    }
+
+    private boolean isCapturing() {
+        return activeCapture != null;
+    }
 
     private final Runnable nextProof = this::requestRawPreview;
     private final Runnable clearStatus = () -> {
         showingTransientStatus = false;
-        if (ready && !busy) setStatus();
+        if (ready && !isCapturing()) setStatus();
     };
 
     @Override protected void onCreate(Bundle state) {
@@ -94,7 +116,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
         sameFrame = prefs.getBoolean("sameFrame", false);
         keepDng = prefs.getBoolean("keepDng", false);
         liveRaw = prefs.getBoolean("liveRaw", false);
-        multiFrame = prefs.getBoolean("multiFrame", true);
+        multiFrame = prefs.getBoolean("multiFrame", false);
         ultraHdr = prefs.getBoolean("ultraHdr", Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE);
         showGrid = prefs.getBoolean("showGrid", true);
         showHistogram = prefs.getBoolean("showHistogram", false);
@@ -117,19 +139,19 @@ public final class MainActivity extends Activity implements SensorEventListener 
         ui.gallery.setOnClickListener(v -> review());
         ui.helpButton.setOnClickListener(v -> showGuide());
         ui.filterButton.setOnClickListener(v -> {
-            if (ready && !busy && !dialogOpen) {
+            if (ready && !isCapturing() && !dialogOpen) {
                 setTrayOpen(ui.activeTray() == CameraScreen.TRAY_FILTER
                         ? CameraScreen.TRAY_LENS : CameraScreen.TRAY_FILTER);
             }
         });
         ui.evChip.setOnClickListener(v -> {
-            if (ready && !busy && !dialogOpen) {
+            if (ready && !isCapturing() && !dialogOpen) {
                 setTrayOpen(ui.activeTray() == CameraScreen.TRAY_EV
                         ? CameraScreen.TRAY_LENS : CameraScreen.TRAY_EV);
             }
         });
         ui.wbChip.setOnClickListener(v -> {
-            if (ready && !busy && !dialogOpen) {
+            if (ready && !isCapturing() && !dialogOpen) {
                 setTrayOpen(ui.activeTray() == CameraScreen.TRAY_WB
                         ? CameraScreen.TRAY_LENS : CameraScreen.TRAY_WB);
             }
@@ -143,7 +165,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
         setupWbPresets();
 
         ui.hdrToggle.setOnClickListener(v -> {
-            if (!ready || busy || dialogOpen || !canUseUltraHdr(captureFormat() == ImageFormat.RAW_SENSOR)) {
+            if (!ready || isCapturing() || dialogOpen || !canUseUltraHdr(captureFormat() == ImageFormat.RAW_SENSOR)) {
                 return;
             }
             ultraHdr = !ultraHdr;
@@ -152,7 +174,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
             showTransientStatus(ultraHdr ? "亮彩已开 · 阳光和灯光更通透" : "亮彩已关 · 标准亮度出图", 3000);
         });
         ui.dngToggle.setOnClickListener(v -> {
-            if (!ready || busy || dialogOpen || captureFormat() != ImageFormat.RAW_SENSOR) return;
+            if (!ready || isCapturing() || dialogOpen || captureFormat() != ImageFormat.RAW_SENSOR) return;
             keepDng = !keepDng;
             getPreferences(MODE_PRIVATE).edit().putBoolean("keepDng", keepDng).apply();
             updateQuickToggles();
@@ -208,7 +230,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
     private void setupFinderGestures() {
         GestureDetector detector = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
             @Override public boolean onSingleTapUp(MotionEvent e) {
-                if (!ready || busy || dialogOpen || camera == null) return false;
+                if (!ready || isCapturing() || dialogOpen || camera == null) return false;
                 float vw = ui.viewport.getWidth(), vh = ui.viewport.getHeight();
                 if (vw <= 0 || vh <= 0) return false;
                 float nx = Math.max(0.05f, Math.min(0.95f, e.getX() / vw));
@@ -221,7 +243,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
             }
 
             @Override public void onLongPress(MotionEvent e) {
-                if (!ready || busy || dialogOpen || camera == null) return;
+                if (!ready || isCapturing() || dialogOpen || camera == null) return;
                 float vw = ui.viewport.getWidth(), vh = ui.viewport.getHeight();
                 if (vw <= 0 || vh <= 0) return;
                 float nx = Math.max(0.05f, Math.min(0.95f, e.getX() / vw));
@@ -245,7 +267,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
                         draggingEv = false;
                         return true;
                     case MotionEvent.ACTION_MOVE:
-                        if (!ready || busy || dialogOpen) return false;
+                        if (!ready || isCapturing() || dialogOpen) return false;
                         float dy = event.getY() - downY;
                         if (!draggingEv && Math.abs(dy) > ui.dp(22) && event.getPointerCount() == 1) {
                             draggingEv = true;
@@ -315,6 +337,11 @@ public final class MainActivity extends Activity implements SensorEventListener 
         super.onPause();
     }
 
+    @Override protected void onDestroy() {
+        if (activeViewer != null) activeViewer.dismiss();
+        super.onDestroy();
+    }
+
     private void updateHorizonSensor() {
         if (sensorManager == null || accelerometer == null) return;
         sensorManager.unregisterListener(this);
@@ -377,7 +404,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
                     if (l.id.equals(selected)) currentLensMm = l.equivalentMm;
                 }
                 ui.setLenses(lenses, selected, lens -> {
-                    if (busy || !foreground || (lens.id.equals(selectedLens) && ready)) return;
+                    if (isCapturing() || !foreground || (lens.id.equals(selectedLens) && ready)) return;
                     selectedLens = lens.id;
                     currentLensMm = lens.equivalentMm;
                     applyUserEv(0f);
@@ -415,7 +442,10 @@ public final class MainActivity extends Activity implements SensorEventListener 
         renderer = new FrameRenderer(surface, new FrameRenderer.Listener() {
             @Override public void onInputReady(SurfaceTexture input) {
                 if (session != run) return;
-                ready = busy = false;
+                ready = false;
+                if (activeCapture != null && activeCapture.format == ImageFormat.UNKNOWN) {
+                    actionFailed(activeCapture, "快拍已取消，请重试");
+                }
                 renderer.setFilter(filter);
                 renderer.setWhiteBalancePreview(manualKelvin, manualTint);
                 renderer.setHistogramEnabled(showHistogram);
@@ -434,16 +464,8 @@ public final class MainActivity extends Activity implements SensorEventListener 
                 if (!guideShown) showGuide();
             }
 
-            @Override public void onPhoto(Bitmap bitmap) {
-                if (session != run) {
-                    bitmap.recycle();
-                    return;
-                }
-                savePreviewFrame(bitmap, shutterTime, session, filter);
-            }
-
             @Override public void onHighlightMeter(boolean protect) {
-                if (session == run && ready && !busy && captureFormat() == ImageFormat.RAW_SENSOR) {
+                if (session == run && ready && !isCapturing() && captureFormat() == ImageFormat.RAW_SENSOR) {
                     highlightProtecting = protect;
                     camera.protectHighlights(protect);
                     ui.updateTelemetry(latestTelemetry, highlightProtecting, userEvBias);
@@ -477,6 +499,12 @@ public final class MainActivity extends Activity implements SensorEventListener 
 
     private void stopPreview() {
         ++run;
+        ready = false;
+        if (activeCapture != null && (waitingForProof || activeCapture.format == ImageFormat.UNKNOWN)) {
+            finishCapture(activeCapture);
+            notifyPendingSaveFinished();
+        }
+        activeCapture = null;
         ui.coverFinder();
         main.removeCallbacks(nextProof);
         main.removeCallbacks(clearStatus);
@@ -493,7 +521,6 @@ public final class MainActivity extends Activity implements SensorEventListener 
         camera = null;
         renderer = null;
         surface = null;
-        ready = busy = false;
         stillFormat = ImageFormat.UNKNOWN;
         ui.dimensions.setText("");
         ui.telemetry.setText("");
@@ -508,13 +535,17 @@ public final class MainActivity extends Activity implements SensorEventListener 
     }
 
     private void refreshControls() {
-        ui.controls(ready, busy);
+        ui.controls(ready, isCapturing());
+        if (ready && !isCapturing() && pendingSaves >= 2) {
+            ui.shutter.setEnabled(false);
+            ui.shutter.setAlpha(0.55f);
+        }
         updateQuickToggles();
     }
 
     private void updateQuickToggles() {
         boolean raw = captureFormat() == ImageFormat.RAW_SENSOR;
-        boolean controlsEnabled = ready && !busy;
+        boolean controlsEnabled = ready && !isCapturing();
         ui.updateQuickToggle(ui.hdrToggle, canUseUltraHdr(raw), ultraHdr, controlsEnabled);
         ui.updateQuickToggle(ui.dngToggle, raw, keepDng, controlsEnabled);
     }
@@ -532,7 +563,9 @@ public final class MainActivity extends Activity implements SensorEventListener 
 
     private void setStatus() {
         if (showingTransientStatus) return;
-        if (ui.activeTray() == CameraScreen.TRAY_FILTER) {
+        if (pendingSaves > 0 && !isCapturing()) {
+            ui.status.setText(pendingSaves > 1 ? "正在冲洗 " + pendingSaves + " 张照片…" : "正在冲洗照片…");
+        } else if (ui.activeTray() == CameraScreen.TRAY_FILTER) {
             ui.status.setText("");
         } else if (ui.rawPreview.getVisibility() == View.VISIBLE) {
             ui.status.setText("原彩预览中");
@@ -554,7 +587,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
         }
         ui.showTray(tray);
         ui.updateProChips(userEvBias, manualKelvin);
-        if (ready && !busy) setStatus();
+        if (ready && !isCapturing()) setStatus();
     }
 
     @TargetApi(Build.VERSION_CODES.TIRAMISU)
@@ -566,7 +599,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
     }
 
     private void selectFilter(PhotoFilter selected) {
-        if (!ready || busy || selected == filter) return;
+        if (!ready || isCapturing() || selected == filter) return;
         filter = selected;
         getPreferences(MODE_PRIVATE).edit().putString("photoFilter", filter.id).apply();
         ui.updateFilter(filter);
@@ -601,7 +634,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
     }
 
     private void showGuide() {
-        if (!foreground || isFinishing() || busy || dialogOpen) return;
+        if (!foreground || isFinishing() || isCapturing() || dialogOpen) return;
         setTrayOpen(CameraScreen.TRAY_LENS);
         dialogOpen = true;
         main.removeCallbacks(nextProof);
@@ -670,7 +703,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
     }
 
     private void chooseMode() {
-        if (!ready || busy || dialogOpen) return;
+        if (!ready || isCapturing() || dialogOpen) return;
         setTrayOpen(CameraScreen.TRAY_LENS);
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
@@ -699,7 +732,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
         modes.check(captureFormat() == ImageFormat.UNKNOWN ? preview.getId() : sensor.getId());
 
         CheckBox mfBox = new CheckBox(this);
-        CameraPanels.option(ui, mfBox, "多帧降噪", "合成多张照片，减少暗部噪点");
+        CameraPanels.option(ui, mfBox, "暗光多帧降噪", "仅在极暗环境合成多张降噪，拍照等待会变长；默认关闭，日常单帧更快");
         mfBox.setChecked(multiFrame);
         if (rawAvailable) {
             CameraPanels.divider(ui, modeCard);
@@ -794,8 +827,8 @@ public final class MainActivity extends Activity implements SensorEventListener 
     }
 
     private boolean wantsProof() {
-        return ready && foreground && !dialogOpen && !busy && !proofUnavailable
-                && liveRaw && captureFormat() == ImageFormat.RAW_SENSOR;
+        return ready && foreground && !dialogOpen && !isCapturing() && pendingSaves == 0
+                && !proofUnavailable && liveRaw && captureFormat() == ImageFormat.RAW_SENSOR;
     }
 
     private void scheduleProof() {
@@ -835,7 +868,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
         } else if (result == null) {
             proofUnavailable = true;
             hideProof();
-            if (!busy && !showingTransientStatus) ui.status.setText("实景预览已暂停，可正常拍照");
+            if (!isCapturing() && !showingTransientStatus) ui.status.setText("实景预览已暂停，可正常拍照");
         } else if (wantsProof()) {
             boolean first = ui.rawPreview.getVisibility() != View.VISIBLE;
             ui.rawPreview.setImageBitmap(result);
@@ -846,7 +879,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
         }
         if (waitingForProof) {
             waitingForProof = false;
-            submitShutter();
+            submitShutter(activeCapture);
         } else {
             scheduleProof();
         }
@@ -863,48 +896,55 @@ public final class MainActivity extends Activity implements SensorEventListener 
     }
 
     private void pressShutter() {
-        if (!ready || busy || dialogOpen) return;
+        if (!ready || isCapturing() || pendingSaves >= 2 || dialogOpen) return;
         ui.shutter.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
         ui.shutterFeedback();
-        busy = true;
+        Capture capture = new Capture(run, captureFormat(), currentLensMm, filter);
+        activeCapture = lastCapture = capture;
+        pendingSaves++;
+        ui.setGalleryProcessing(true);
         main.removeCallbacks(nextProof);
         main.removeCallbacks(clearStatus);
         showingTransientStatus = false;
         refreshControls();
-        shutterTime = System.currentTimeMillis();
         ui.status.setText("正在拍摄…");
         if (proofInFlight) waitingForProof = true;
-        else submitShutter();
+        else submitShutter(capture);
     }
 
-    private void submitShutter() {
-        int session = run;
-        int format = captureFormat();
-        if (format == ImageFormat.UNKNOWN) {
-            renderer.shoot(deviceRotation, filter);
+    private void submitShutter(Capture capture) {
+        if (capture.format == ImageFormat.UNKNOWN) {
+            renderer.shoot(deviceRotation, capture.filter, bitmap -> {
+                if (activeCapture != capture) {
+                    bitmap.recycle();
+                    return;
+                }
+                handOffCapture(capture, "正在保存照片…");
+                savePreviewFrame(bitmap, capture);
+            });
             return;
         }
-        long stamp = shutterTime;
-        boolean saveNegative = format == ImageFormat.RAW_SENSOR && keepDng;
-        PhotoFilter selected = filter;
+        long stamp = capture.stamp;
+        boolean saveNegative = capture.format == ImageFormat.RAW_SENSOR && keepDng;
+        PhotoFilter selected = capture.filter;
         boolean compare = compareBaseline;
-        int lensMm = currentLensMm;
+        int lensMm = capture.lensMm;
         RawRenderer.Options opt = buildRenderOptions(selected, true);
 
-        if (format == ImageFormat.RAW_SENSOR && multiFrame && !compare
+        if (capture.format == ImageFormat.RAW_SENSOR && multiFrame && !compare
                 && camera != null && camera.supportsBurst()) {
             int iso = camera.latestIso();
             long expNs = camera.latestExposureNs();
-            boolean guard = camera.isHighlightProtected();
-            boolean skipBurstForBrightDaylight = iso > 0 && iso <= 125
-                    && expNs > 0L && expNs <= 10_000_000L && !guard && lensMm < 45;
-            if (!skipBurstForBrightDaylight) {
-                int burstCount = iso >= 800 ? 5 : (iso >= 350 || expNs > 20_000_000L) ? 4 : 3;
+            boolean needBurst = (lensMm >= 45)
+                    ? (iso >= 800 || expNs >= 33_333_333L)
+                    : (iso >= 1000 || expNs >= 40_000_000L);
+            if (needBurst) {
+                int burstCount = iso >= 1600 ? 4 : 3;
                 final boolean[] dngSaved = {false};
                 final boolean[] dngFailed = {false};
                 camera.captureBurst(deviceRotation, burstCount, saveNegative, new StillStream.BurstCallback() {
                     @Override public void onProgress(int framesReceived, int totalFrames) {
-                        if (session == run) ui.status.setText("连拍合成中 " + framesReceived + "/" + totalFrames);
+                        if (activeCapture == capture) ui.status.setText("暗光合成中 " + framesReceived + "/" + totalFrames);
                     }
 
                     @Override public void onFirstFrameForDng(Image image, CameraCharacteristics info,
@@ -923,9 +963,7 @@ public final class MainActivity extends Activity implements SensorEventListener 
                                                        TotalCaptureResult refResult, int degrees,
                                                        float fallbackGuardEv) {
                         opt.fallbackMeteredBiasEv = fallbackGuardEv;
-                        main.post(() -> {
-                            if (session == run) ui.status.setText("正在优化画质…");
-                        });
+                        main.post(() -> handOffCapture(capture, "正在优化画质…"));
                         try {
                             Bitmap developed = RawRenderer.renderMerged(merged, channel, width, height,
                                     info, refResult, degrees, opt);
@@ -942,15 +980,15 @@ public final class MainActivity extends Activity implements SensorEventListener 
                             if (opt.ultraHdr) {
                                 msg += " · 亮彩";
                             }
-                            photoSaved(saved, msg, stamp, session);
+                            photoSaved(saved, msg, capture);
                         } catch (IOException | RuntimeException | OutOfMemoryError e) {
                             Log.e("TrueHue", "Cannot save burst capture", e);
-                            main.post(() -> actionFailed(session, "照片保存失败，请检查可用空间后重试"));
+                            main.post(() -> actionFailed(capture, "照片保存失败，请检查可用空间后重试"));
                         }
                     }
 
                     @Override public void onFailure(String message) {
-                        actionFailed(session, message);
+                        actionFailed(capture, message);
                     }
                 });
                 return;
@@ -959,249 +997,264 @@ public final class MainActivity extends Activity implements SensorEventListener 
 
         camera.capture(deviceRotation, new CameraInput.PhotoCallback() {
             @Override public void onImage(Image image, CameraCharacteristics sensor, TotalCaptureResult shot, int angle) {
-                main.post(() -> {
-                    if (session == run) ui.status.setText(format == ImageFormat.RAW_SENSOR ? "正在生成原彩照片…" : "正在保存照片…");
-                });
                 try {
                     if (image.getFormat() == ImageFormat.JPEG) {
+                        main.post(() -> handOffCapture(capture, "正在保存照片…"));
                         Uri saved = PhotoStore.saveDeviceJpeg(getApplicationContext(), image, shot, stamp,
                                 angle, RawRenderer.meteredBias(sensor, shot), selected);
-                        photoSaved(saved, "高清照片已保存", stamp, session);
+                        photoSaved(saved, "高清照片已保存", capture);
                     } else {
-                        developPhoto(image, sensor, shot, angle, opt, compare, saveNegative, lensMm, stamp, session);
+                        developPhotoSnapshot(image, sensor, shot, angle, opt, compare, saveNegative, capture);
                     }
                 } catch (IOException | RuntimeException | OutOfMemoryError e) {
                     Log.e("TrueHue", "Cannot save still capture", e);
-                    main.post(() -> actionFailed(session, "照片保存失败，请检查可用空间后重试"));
+                    main.post(() -> actionFailed(capture, "照片保存失败，请检查可用空间后重试"));
                 }
             }
-            @Override public void onFailure(String message) { actionFailed(session, message); }
+            @Override public void onFailure(String message) { actionFailed(capture, message); }
         });
     }
 
-    private void developPhoto(Image image, CameraCharacteristics sensor, TotalCaptureResult shot,
-                              int angle, RawRenderer.Options opt, boolean compare,
-                              boolean saveNegative, int lensMm, long stamp, int session) throws IOException {
-        Bitmap developed;
-        try {
-            developed = RawRenderer.render(image, sensor, shot, angle, opt);
-        } catch (RuntimeException | OutOfMemoryError e) {
-            Log.e("TrueHue", "Saving DNG after JPEG development failed", e);
-            PhotoStore.saveDng(getApplicationContext(), image, sensor, shot, stamp, angle);
-            main.post(() -> actionFailed(session, "原彩合成失败，已保存原始底片"));
-            return;
-        }
-        Uri saved;
-        try {
-            saved = PhotoStore.save(getApplicationContext(), developed, stamp, shot,
-                    RawRenderer.meteredBias(sensor, shot), opt.natural, false, opt.filter, lensMm);
-        } finally {
-            developed.recycle();
-        }
-        String message = "原彩照片已保存";
+    private void developPhotoSnapshot(Image image, CameraCharacteristics sensor, TotalCaptureResult shot,
+                                      int angle, RawRenderer.Options opt, boolean compare,
+                                      boolean saveNegative, Capture capture) throws IOException {
+        long stamp = capture.stamp;
+        boolean dngSaved = false;
+        boolean dngFailed = false;
         if (saveNegative) {
             try {
                 PhotoStore.saveDng(getApplicationContext(), image, sensor, shot, stamp, angle);
-                message = "照片与底片已保存";
+                dngSaved = true;
             } catch (IOException | RuntimeException e) {
                 Log.e("TrueHue", "Optional DNG could not be saved", e);
-                message = "照片已保存，底片写入失败";
+                dngFailed = true;
             }
         }
+        boolean baselineSaved = false;
+        boolean baselineFailed = false;
         if (compare) {
             try {
                 Bitmap baseline = RawRenderer.render(image, sensor, shot, angle, false, PhotoFilter.ORIGINAL);
                 try {
                     PhotoStore.save(getApplicationContext(), baseline, stamp, shot,
-                            RawRenderer.meteredBias(sensor, shot), false, true, PhotoFilter.ORIGINAL, lensMm);
+                            RawRenderer.meteredBias(sensor, shot), false, true, PhotoFilter.ORIGINAL, capture.lensMm);
                 } finally {
                     baseline.recycle();
                 }
-                message += " · 已存对照图";
+                baselineSaved = true;
             } catch (IOException | RuntimeException | OutOfMemoryError e) {
                 Log.w("TrueHue", "Cannot save baseline companion", e);
-                message += " · 对照图保存失败";
+                baselineFailed = true;
             }
         }
-        photoSaved(saved, message, stamp, session);
+        RawRenderer.RawSnapshot snap;
+        try {
+            snap = RawRenderer.extractSnapshot(image, sensor, shot, angle);
+        } catch (RuntimeException | OutOfMemoryError e) {
+            Log.e("TrueHue", "Saving DNG after RAW snapshot extraction failed", e);
+            if (!dngSaved) PhotoStore.saveDng(getApplicationContext(), image, sensor, shot, stamp, angle);
+            main.post(() -> actionFailed(capture, "原彩显影失败，已保存原始底片"));
+            return;
+        }
+        main.post(() -> handOffCapture(capture, null));
+        final boolean finalDngSaved = dngSaved;
+        final boolean finalDngFailed = dngFailed;
+        final boolean finalBaselineSaved = baselineSaved;
+        final boolean finalBaselineFailed = baselineFailed;
+        StillStream.DEVELOPMENT.execute(() -> {
+            Bitmap developed;
+            try {
+                developed = RawRenderer.renderSnapshot(snap, opt);
+            } catch (RuntimeException | OutOfMemoryError e) {
+                Log.e("TrueHue", "Cannot develop RAW snapshot", e);
+                String message = "原彩显影失败，已保存原始底片";
+                if (!finalDngSaved) {
+                    try {
+                        PhotoStore.saveDng(getApplicationContext(), snap, stamp);
+                    } catch (IOException | RuntimeException | OutOfMemoryError recoveryError) {
+                        Log.e("TrueHue", "Cannot save recovery DNG", recoveryError);
+                        message = "原彩显影失败，底片也未能保存";
+                    }
+                }
+                String result = message;
+                main.post(() -> actionFailed(capture, result));
+                return;
+            }
+            try {
+                Uri saved = PhotoStore.save(getApplicationContext(), developed, stamp, shot,
+                        RawRenderer.meteredBias(sensor, shot), opt.natural, false, opt.filter, capture.lensMm);
+                String message = finalDngSaved ? "照片与底片已保存"
+                        : finalDngFailed ? "照片已保存，底片写入失败" : "原彩照片已保存";
+                if (finalBaselineSaved) message += " · 已存对照图";
+                else if (finalBaselineFailed) message += " · 对照图保存失败";
+                photoSaved(saved, message, capture);
+            } catch (IOException | RuntimeException | OutOfMemoryError e) {
+                Log.e("TrueHue", "Cannot save developed RAW photo", e);
+                main.post(() -> actionFailed(capture, "照片保存失败，请检查可用空间后重试"));
+            } finally {
+                developed.recycle();
+            }
+        });
     }
 
-    private void savePreviewFrame(Bitmap image, long timestamp, int session, PhotoFilter selected) {
+    private void savePreviewFrame(Bitmap image, Capture capture) {
         FILES.execute(() -> {
             try {
-                Uri saved = PhotoStore.save(getApplicationContext(), image, timestamp, null,
-                        Float.NaN, false, false, selected, currentLensMm);
-                photoSaved(saved, "快拍照片已保存", timestamp, session);
-            } catch (IOException | RuntimeException e) {
+                Uri saved = PhotoStore.save(getApplicationContext(), image, capture.stamp, null,
+                        Float.NaN, false, false, capture.filter, capture.lensMm);
+                photoSaved(saved, "快拍照片已保存", capture);
+            } catch (IOException | RuntimeException | OutOfMemoryError e) {
                 Log.e("TrueHue", "Cannot save preview capture", e);
-                main.post(() -> actionFailed(session, "照片保存失败，请检查可用空间后重试"));
+                main.post(() -> actionFailed(capture, "照片保存失败，请检查可用空间后重试"));
             } finally {
                 image.recycle();
             }
         });
     }
 
-    private void photoSaved(Uri saved, String message, long stamp, int session) {
+    private void handOffCapture(Capture capture, String message) {
+        if (activeCapture != capture) return;
+        activeCapture = null;
+        refreshControls();
+        if (message == null) setStatus();
+        else ui.status.setText(message);
+    }
+
+    private boolean finishCapture(Capture capture) {
+        if (capture.finished) return false;
+        capture.finished = true;
+        if (activeCapture == capture) {
+            activeCapture = null;
+            waitingForProof = false;
+        }
+        pendingSaves--;
+        ui.setGalleryProcessing(pendingSaves > 0);
+        return true;
+    }
+
+    private void photoSaved(Uri saved, String message, Capture capture) {
         main.post(() -> {
-            if (stamp >= getPreferences(MODE_PRIVATE).getLong("lastTime", 0)) {
-                getPreferences(MODE_PRIVATE).edit().putString("last", saved.toString()).putLong("lastTime", stamp).apply();
+            boolean currentSession = capture.session == run;
+            if (!finishCapture(capture)) return;
+            if (capture.stamp >= getPreferences(MODE_PRIVATE).getLong("lastTime", 0)) {
+                getPreferences(MODE_PRIVATE).edit().putString("last", saved.toString())
+                        .putLong("lastTime", capture.stamp).apply();
                 if (!isDestroyed()) {
                     lastPhoto = saved;
-                    updateThumbnail(saved, foreground && session == run);
+                    updateThumbnail(saved, foreground && currentSession);
                 }
             }
-            if (session != run) return;
-            busy = false;
-            main.removeCallbacks(clearStatus);
-            showingTransientStatus = false;
-            ui.status.setText(message);
+            if (activeViewer != null) activeViewer.onPhotoSaved(saved, capture.stamp, pendingSaves > 0);
             refreshControls();
             scheduleProof();
-            main.postDelayed(() -> {
-                if (run == session && ready && !busy && shutterTime == stamp) setStatus();
-            }, 2600);
+            if (currentSession && lastCapture == capture) showTransientStatus(message, 2600);
+            else if (ready && !isCapturing()) setStatus();
         });
     }
 
-    private void actionFailed(int session, String message) {
-        if (session != run) return;
-        busy = false;
-        ui.status.setText(message);
+    private void actionFailed(Capture capture, String message) {
+        if (!finishCapture(capture)) return;
+        notifyPendingSaveFinished();
         refreshControls();
         scheduleProof();
+        if (capture.session == run && lastCapture == capture) showTransientStatus(message, 3000);
+        else if (ready && !isCapturing()) setStatus();
+    }
+
+    private void notifyPendingSaveFinished() {
+        if (activeViewer != null && pendingSaves == 0) activeViewer.onPendingSaveFinished();
     }
 
     private void loadLastPhoto() {
-        String saved = getPreferences(MODE_PRIVATE).getString("last", null);
-        if (saved == null) return;
-        lastPhoto = Uri.parse(saved);
-        updateThumbnail(lastPhoto, false);
+        int generation = ++lastPhotoLoadGeneration;
+        Uri previous = lastPhoto;
+        FILES.execute(() -> {
+            List<PhotoStore.PhotoEntry> recent = PhotoStore.listPhotos(getApplicationContext(), 1);
+            SharedPreferences prefs = getPreferences(MODE_PRIVATE);
+            String saved = prefs.getString("last", null);
+            long recentTime = !recent.isEmpty() ? recent.get(0).takenAt : prefs.getLong("lastTime", 0);
+            Uri resolved = !recent.isEmpty() ? recent.get(0).uri : (saved != null ? Uri.parse(saved) : null);
+            Bitmap thumb = null;
+            try {
+                if (resolved != null) thumb = PhotoStore.readThumbnail(getApplicationContext(), resolved, 200);
+            } catch (IOException | RuntimeException ex) {
+                Log.w("TrueHue", "Cannot load the album thumbnail", ex);
+            }
+            Bitmap thumbnail = thumb;
+            main.post(() -> {
+                if (isDestroyed() || generation != lastPhotoLoadGeneration || !Objects.equals(previous, lastPhoto)) return;
+                lastPhoto = thumbnail == null && recent.isEmpty() ? null : resolved;
+                if (lastPhoto != null) {
+                    prefs.edit().putString("last", lastPhoto.toString()).putLong("lastTime", recentTime).apply();
+                } else {
+                    prefs.edit().remove("last").remove("lastTime").apply();
+                }
+                ui.showThumbnail(thumbnail, false);
+                ui.setGalleryHasPhoto(lastPhoto != null);
+            });
+        });
     }
 
     private void updateThumbnail(Uri uri, boolean animate) {
         FILES.execute(() -> {
             try {
-                Bitmap thumb = PhotoStore.read(getApplicationContext(), uri, 200);
+                Bitmap thumb = PhotoStore.readThumbnail(getApplicationContext(), uri, 200);
                 main.post(() -> {
                     if (!isDestroyed() && uri.equals(lastPhoto)) ui.showThumbnail(thumb, animate && foreground);
                 });
             } catch (IOException | RuntimeException ex) {
                 main.post(() -> {
-                    if (!isDestroyed() && uri.equals(lastPhoto)) ui.showThumbnail(null, false);
+                    if (!isDestroyed() && uri.equals(lastPhoto)) {
+                        ui.showThumbnail(null, false);
+                        ui.setGalleryHasPhoto(true);
+                    }
                 });
             }
         });
     }
 
     private void review() {
-        final Uri uri = lastPhoto;
-        if (uri == null || dialogOpen) return;
+        if ((lastPhoto == null && pendingSaves == 0) || dialogOpen || !foreground || isFinishing() || isDestroyed()) {
+            return;
+        }
+        setTrayOpen(CameraScreen.TRAY_LENS);
         dialogOpen = true;
         main.removeCallbacks(nextProof);
-        int edge = Math.max(ui.getWidth(), ui.getHeight());
-        FILES.execute(() -> {
-            try {
-                Bitmap image = PhotoStore.read(getApplicationContext(), uri, Math.max(1080, edge));
-                PhotoStore.PhotoMeta meta = PhotoStore.readMeta(getApplicationContext(), uri);
-                main.post(() -> {
-                    if (foreground && !isFinishing() && !isDestroyed()) showPhoto(image, uri, meta);
-                    else {
-                        image.recycle();
-                        dialogOpen = false;
-                    }
-                });
-            } catch (IOException | RuntimeException ex) {
-                main.post(() -> {
-                    dialogOpen = false;
-                    scheduleProof();
-                    if (foreground) Toast.makeText(this, "这张照片已无法打开", Toast.LENGTH_SHORT).show();
-                });
+        activeViewer = PhotoViewer.open(this, ui, lastPhoto, pendingSaves > 0, new PhotoViewer.Host() {
+            @Override public void onShare(Uri uri) {
+                sharePhoto(uri);
+            }
+
+            @Override public void onOpenInGallery(Uri uri) {
+                openInGallery(uri);
+            }
+
+            @Override public void onLibraryChanged(Uri newestUri, long newestTakenAt) {
+                if (isDestroyed()) return;
+                SharedPreferences prefs = getPreferences(MODE_PRIVATE);
+                if (Objects.equals(lastPhoto, newestUri) && prefs.getLong("lastTime", 0) == newestTakenAt) return;
+                ++lastPhotoLoadGeneration;
+                lastPhoto = newestUri;
+                SharedPreferences.Editor edit = prefs.edit();
+                if (newestUri != null) {
+                    edit.putString("last", newestUri.toString()).putLong("lastTime", newestTakenAt).apply();
+                    updateThumbnail(newestUri, false);
+                } else {
+                    edit.remove("last").remove("lastTime").apply();
+                    ui.showThumbnail(null, false);
+                }
+            }
+
+            @Override public void onPhotoDeleted(Uri uri) {
+                if (!isDestroyed() && uri.equals(lastPhoto)) loadLastPhoto();
+            }
+
+            @Override public void onDismiss() {
+                activeViewer = null;
+                dialogOpen = false;
+                scheduleProof();
             }
         });
-    }
-
-    private void showPhoto(Bitmap image, Uri uri, PhotoStore.PhotoMeta meta) {
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-        content.setBackgroundColor(CameraScreen.BG);
-        Dialog dialog = CameraPanels.photo(ui, content);
-        if (dialog.getWindow() != null) {
-            dialog.getWindow().setColorMode(ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT);
-        }
-
-        LinearLayout header = new LinearLayout(this);
-        header.setGravity(Gravity.CENTER_VERTICAL);
-        header.setPadding(ui.dp(8), 0, ui.dp(12), 0);
-        content.addView(header, new LinearLayout.LayoutParams(-1, ui.dp(56)));
-
-        CameraScreen.Mark back = new CameraScreen.Mark(this, CameraScreen.Mark.BACK);
-        back.setContentDescription("回到取景");
-        back.setForeground(ui.ripple(24));
-        back.setFocusable(true);
-        back.setOnClickListener(v -> dialog.dismiss());
-        header.addView(back, new LinearLayout.LayoutParams(ui.dp(48), ui.dp(48)));
-        header.addView(CameraPanels.heading(ui, "上张照片"), new LinearLayout.LayoutParams(0, -2, 1));
-
-        if (meta != null) {
-            TextView modePill = ui.label(meta.modeLabel, 11, CameraScreen.INK);
-            modePill.setPadding(ui.dp(8), ui.dp(3), ui.dp(8), ui.dp(3));
-            modePill.setBackground(ui.rounded(CameraScreen.ELEVATED, 10, CameraScreen.LINE));
-            LinearLayout.LayoutParams mp = new LinearLayout.LayoutParams(-2, -2);
-            mp.setMarginEnd(ui.dp(6));
-            header.addView(modePill, mp);
-            if (meta.ultraHdr) {
-                TextView hdrPill = ui.label("亮彩", 11, CameraScreen.ACCENT);
-                hdrPill.setContentDescription("高光亮彩照片");
-                hdrPill.setPadding(ui.dp(8), ui.dp(3), ui.dp(8), ui.dp(3));
-                hdrPill.setBackground(ui.rounded(0x26e8a838, 10, CameraScreen.ACCENT));
-                LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(-2, -2);
-                hp.setMarginEnd(ui.dp(6));
-                header.addView(hdrPill, hp);
-            }
-        }
-
-        CameraScreen.Mark share = new CameraScreen.Mark(this, CameraScreen.Mark.SHARE);
-        share.setContentDescription("分享照片");
-        share.setForeground(ui.ripple(24));
-        share.setFocusable(true);
-        share.setOnClickListener(v -> sharePhoto(uri));
-        header.addView(share, new LinearLayout.LayoutParams(ui.dp(44), ui.dp(44)));
-
-        CameraPanels.ZoomableImageView photo = new CameraPanels.ZoomableImageView(this);
-        photo.setImageBitmap(image);
-        photo.setContentDescription("最近拍摄的照片，支持双指缩放与双击放大");
-        content.addView(photo, new LinearLayout.LayoutParams(-1, 0, 1));
-
-        LinearLayout footer = new LinearLayout(this);
-        footer.setOrientation(LinearLayout.VERTICAL);
-        footer.setGravity(Gravity.CENTER_HORIZONTAL);
-        footer.setPadding(ui.dp(16), ui.dp(10), ui.dp(16), ui.dp(18));
-        content.addView(footer, new LinearLayout.LayoutParams(-1, -2));
-
-        if (meta != null) {
-            String barText = showProInfo && !meta.summary.isEmpty()
-                    ? meta.summary + " · " + meta.look
-                    : "风格：" + meta.look + " · 双指缩放可看细节";
-            TextView exifBar = ui.label(barText, 12, CameraScreen.MUTED);
-            exifBar.setFontFeatureSettings("tnum");
-            exifBar.setGravity(Gravity.CENTER);
-            exifBar.setPadding(0, 0, 0, ui.dp(10));
-            footer.addView(exifBar);
-        }
-
-        TextView open = CameraPanels.button(ui, "在相册中打开", false, v -> {
-            dialog.dismiss();
-            openInGallery(uri);
-        });
-        footer.addView(open, new LinearLayout.LayoutParams(-2, -2));
-
-        dialog.setOnDismissListener(d -> {
-            dialogOpen = false;
-            photo.setImageDrawable(null);
-            image.recycle();
-            scheduleProof();
-        });
-        dialog.show();
     }
 
     private void sharePhoto(Uri uri) {

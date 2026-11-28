@@ -124,6 +124,16 @@ public final class RawDevelopmentCheck {
         if ((PhotoFilter.DETAIL.apply(0xff555555)&255) >= 0x55
                 || (PhotoFilter.DETAIL.apply(0xffdddddd)&255) <= 0xdd) throw new AssertionError("Defined tones");
         if ((PhotoFilter.MASTER.apply(0xff484848)&255) >= 0x48) throw new AssertionError("Master shadow anchor");
+        if ((PhotoFilter.MASTER.apply(0xff888888)&255) < 0x88) throw new AssertionError("Master crushed neutral midtone");
+        int masterBlue = PhotoFilter.MASTER.apply(0xff3060c8);
+        int origBlue = PhotoFilter.ORIGINAL.apply(0xff3060c8);
+        if ((masterBlue & 255) - (masterBlue >> 16 & 255) < (origBlue & 255) - (origBlue >> 16 & 255)) {
+            throw new AssertionError("Master blue depth weakened");
+        }
+        int masterWarm = PhotoFilter.MASTER.apply(0xffa86828);
+        if ((masterWarm >> 16 & 255) < 0xa8) {
+            throw new AssertionError("Master warm food midtone darkened: " + (masterWarm >> 16 & 255));
+        }
         int mono = PhotoFilter.MONO.apply(0xffcc6633);
         if ((mono >> 16 & 255) != (mono >> 8 & 255) || (mono >> 8 & 255) != (mono & 255)) {
             throw new AssertionError("Monochrome filter retained color");
@@ -722,6 +732,145 @@ public final class RawDevelopmentCheck {
             throw new AssertionError("Large saturated color was missed");
     }
 
+    private static void checkBacklitRecovery() {
+        int w = 192, h = 160;
+        int[] cfa = BAYER[0];
+        short[] raw = new short[w * h];
+        // Top 15% bright sky (1.2x white), bottom 85% backlit green foliage ({0.035, 0.065, 0.025}).
+        float[] leaf = {0.035f, 0.065f, 0.065f, 0.025f};
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int p = 2 * (y & 1) + (x & 1);
+                float val = (y < h * 15 / 100) ? 1.2f : leaf[cfa[p]];
+                raw[y * w + x] = (short) Math.min(10000, Math.round(10000f * val));
+            }
+        }
+        BayerPipeline pipe = new BayerPipeline(ShortBuffer.wrap(raw), w, 0, 0, w, h, cfa,
+                new float[4], 10000f, UNIT, I, null, 0, 0);
+        BayerPipeline.Options opt = new BayerPipeline.Options();
+        opt.natural = true;
+        opt.wideGamut = false;
+        opt.equivalentMm = 23f;
+        opt.iso = 66;
+        opt.sceneEv = 13.0f;
+        int[] out = new int[w * h];
+        pipe.render(0, opt, (px, ox, oy, pw, ph) -> {
+            for (int r = 0; r < ph; r++) System.arraycopy(px, r * pw, out, (oy + r) * w + ox, pw);
+        });
+        int leafPx = out[(h * 60 / 100) * w + w / 2];
+        int leafG = (leafPx >> 8) & 255;
+        int skyPx = out[(h * 5 / 100) * w + w / 2];
+        int skyG = (skyPx >> 8) & 255;
+        if (leafG < 105) {
+            throw new AssertionError("Backlit foliage stayed too dark: G=" + leafG);
+        }
+        if (skyG >= 252) {
+            throw new AssertionError("Backlit sky clipped: G=" + skyG);
+        }
+        int nearBoundary = (out[(h * 15 / 100 + 2) * w + w / 2] >> 8) & 255;
+        if (Math.abs(nearBoundary - leafG) > 28) {
+            throw new AssertionError("Backlight horizon halo detected: boundaryG=" + nearBoundary + " leafG=" + leafG);
+        }
+    }
+
+    private static void checkIndoorFoodInDarkPan() {
+        int w = 192, h = 160;
+        int[] cfa = BAYER[0];
+        short[] raw = new short[w * h];
+        float[] pan = {0.014f, 0.014f, 0.014f, 0.014f};
+        float[] golden = {0.095f, 0.055f, 0.055f, 0.020f};
+        float[] veg = {0.045f, 0.075f, 0.075f, 0.030f};
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int p = 2 * (y & 1) + (x & 1);
+                float val;
+                if (y < h / 10 || y > h * 9 / 10) {
+                    val = 0.85f; // Bright metallic pan rim
+                } else if (x >= w / 4 && x < w * 3 / 4 && y >= h * 3 / 10 && y < h * 7 / 10) {
+                    val = (x < w / 2) ? golden[cfa[p]] : veg[cfa[p]];
+                } else {
+                    val = pan[cfa[p]];
+                }
+                raw[y * w + x] = (short) Math.round(10000f * val);
+            }
+        }
+        BayerPipeline pipe = new BayerPipeline(ShortBuffer.wrap(raw), w, 0, 0, w, h, cfa,
+                new float[4], 10000f, UNIT, I, null, 0, 0);
+        BayerPipeline.Options opt = new BayerPipeline.Options();
+        opt.natural = true;
+        opt.wideGamut = false;
+        opt.equivalentMm = 60f;
+        opt.iso = 300;
+        opt.sceneEv = 6.5f;
+        int[] out = new int[w * h];
+        pipe.render(0, opt, (px, ox, oy, pw, ph) -> {
+            for (int r = 0; r < ph; r++) System.arraycopy(px, r * pw, out, (oy + r) * w + ox, pw);
+        });
+        int foodPx = out[(h / 2) * w + (w * 3 / 8)];
+        int foodR = (foodPx >> 16) & 255;
+        int foodB = foodPx & 255;
+        int vegPx = out[(h / 2) * w + (w * 5 / 8)];
+        int vegG = (vegPx >> 8) & 255;
+        int panPx = out[(h * 2 / 10) * w + (w / 10)];
+        int panG = (panPx >> 8) & 255;
+        if (foodR < 125 || foodR - foodB < 55 || vegG < 105) {
+            throw new AssertionError("Indoor food remained dull/dark: food=(" + foodR + "," + foodB + ") vegG=" + vegG);
+        }
+        if (panG > 48) {
+            throw new AssertionError("Black pan background washed out: panG=" + panG);
+        }
+    }
+
+    private static void checkFastMathAccuracy() {
+        double[] samples = {0.001, 0.003, 0.015, 0.18, 0.5, 1.0, 2.5, 8.0};
+        for (double v : samples) {
+            float l = BayerPipeline.log2f((float) v);
+            double expectedLog = Math.log(v) / Math.log(2.0);
+            near(l, expectedLog, 0.003);
+            float e = BayerPipeline.exp2f(l);
+            near(e / v, 1.0, 0.003);
+        }
+    }
+
+    private static void checkBrightOrangeHighlightPreservation() {
+        int w = 160, h = 160;
+        int[] cfa = BAYER[0];
+        short[] raw = new short[w * h];
+        float[] cloth = {0.42f, 0.42f, 0.42f, 0.36f};
+        float[] orange = {0.92f, 0.42f, 0.42f, 0.04f};
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int p = 2 * (y & 1) + (x & 1);
+                boolean inOrange = x >= w / 3 && x < w * 2 / 3 && y >= h / 3 && y < h * 2 / 3;
+                float val = inOrange ? orange[cfa[p]] : cloth[cfa[p]];
+                raw[y * w + x] = (short) Math.round(10000f * val);
+            }
+        }
+        BayerPipeline pipe = new BayerPipeline(ShortBuffer.wrap(raw), w, 0, 0, w, h, cfa,
+                new float[4], 10000f, UNIT, I, null, 0, 0);
+        BayerPipeline.Options opt = new BayerPipeline.Options();
+        opt.natural = true;
+        opt.wideGamut = false;
+        opt.equivalentMm = 23f;
+        opt.iso = 133;
+        opt.sceneEv = 9.0f;
+        opt.filter = PhotoFilter.MASTER;
+        int[] out = new int[w * h];
+        pipe.render(0, opt, (px, ox, oy, pw, ph) -> {
+            for (int r = 0; r < ph; r++) System.arraycopy(px, r * pw, out, (oy + r) * w + ox, pw);
+        });
+        int orgPx = out[(h / 2) * w + (w / 2)];
+        int r = (orgPx >> 16) & 255, g = (orgPx >> 8) & 255, b = orgPx & 255;
+        if (r >= 252 || b >= 95 || (r - b) < 150 || (r - g) < 40) {
+            throw new AssertionError("Bright orange bleached or clipped: RGB=(" + r + "," + g + "," + b + ")");
+        }
+        int clothPx = out[(h / 6) * w + (w / 6)];
+        int clothG = (clothPx >> 8) & 255;
+        if (clothG > 205) {
+            throw new AssertionError("Bright cream tablecloth over-boosted: G=" + clothG);
+        }
+    }
+
     private static double decode(int code) {
         double s = code / 255.0;
         return s <= 0.04045 ? s/12.92 : Math.pow((s+0.055)/1.055,2.4);
@@ -745,6 +894,10 @@ public final class RawDevelopmentCheck {
         checkIncompleteChromaticAdaptation();
         checkBurstLuckyImagingAndBlurReject();
         checkUltraHdrPatcher();
+        checkBacklitRecovery();
+        checkIndoorFoodInDarkPan();
+        checkFastMathAccuracy();
+        checkBrightOrangeHighlightPreservation();
         for (int[] cfa : BAYER) {
             short[] raw = sensor(cfa,new float[]{0.22f,0.3f,0.15f,0.55f},false);
             float[] balance = {1,1,2,1};

@@ -54,7 +54,7 @@ final class BayerPipeline {
     private static final float[] OPTICAL_FILMIC = buildOpticalFilmic();
 
     static final ExecutorService POOL = Executors.newFixedThreadPool(
-            Math.min(6, Math.max(2, Runtime.getRuntime().availableProcessors() - 1)),
+            Math.min(8, Math.max(2, Runtime.getRuntime().availableProcessors())),
             job -> {
                 Thread t = new Thread(job, "TrueHue-Worker");
                 t.setDaemon(true);
@@ -367,49 +367,55 @@ final class BayerPipeline {
         // Stage A: Parallel Bayer normalization, shading, hot-pixel guard, directional demosaic, CCM.
         demosaicParallel(yPlane, crPlane, cbPlane, wideGamut);
 
-        // Stage B: Noise-calibrated joint bilateral chroma denoising + gentle flat-area luma cleanup.
+        // Stage B: Noise-calibrated joint bilateral chroma denoising + edge-preserving luma cleanup.
         float effSlope = (opt.noiseSlope > 0 ? opt.noiseSlope : opt.iso * 6.5e-7f)
                 / Math.max(1f, opt.effectiveFrames);
         float effOffset = (opt.noiseOffset > 0 ? opt.noiseOffset : 1e-6f)
                 / Math.max(1f, opt.effectiveFrames);
-        if (width >= 32 && height >= 32 && (opt.noiseSlope > 0 || opt.iso >= 150)) {
+        boolean needChromaDn = width >= 32 && height >= 32
+                && ((opt.noiseSlope > 0f && (opt.iso <= 0 || opt.iso >= 160 || effSlope >= 8e-5f))
+                || opt.iso >= 160);
+        if (needChromaDn) {
             denoiseChromaBilateral(yPlane, crPlane, cbPlane, effSlope, effOffset);
-            if (effSlope > 1.2e-4f) {
+            if (effSlope > 9e-5f || opt.iso >= 200) {
                 denoiseAndClarityLuma(yPlane, effSlope, effOffset);
             }
         }
 
-        // Stage C: Physically-grounded scene exposure placement + veiling-glare black-point anchor.
-        SceneStats sceneStats = computeSceneExposure(yPlane, opt);
+        // Stage C: Peak- and center-weighted scene exposure placement + bright-scene-gated glare anchor.
+        SceneStats sceneStats = computeSceneExposure(yPlane, crPlane, cbPlane, opt);
         float exposure = sceneStats.exposure;
 
         // Stage D: 1/4-res guided log-luminance light & shadow sculpting (zero halo).
         float[] baseGrid = null;
         int baseW = 0, baseH = 0;
-        float baseDr = 0f;
         float shadowBoost = 0f;
+        boolean ultra = opt.equivalentMm > 0 && opt.equivalentMm < 20;
+        boolean tele = opt.equivalentMm >= 45;
+        float noisy = opt.iso <= 0 ? 0.30f
+                : smoothStep((opt.iso - (tele ? 220f : 280f)) / (ultra ? 650f : tele ? 900f : 1600f));
         if (width >= 64 && height >= 64) {
             baseW = width / 4;
             baseH = height / 4;
             baseGrid = buildIlluminationBase(yPlane, exposure, baseW, baseH);
             float[] bPct = computeBasePercentiles(baseGrid);
-            baseDr = bPct[1] - bPct[0];
-            boolean ultra = opt.equivalentMm > 0 && opt.equivalentMm < 20;
-            boolean tele = opt.equivalentMm >= 45;
-            float noisy = opt.iso <= 0 ? 0.35f
-                    : smoothStep((opt.iso - (tele ? 180f : 220f)) / (ultra ? 600f : tele ? 750f : 1300f));
-            float drGate = smoothStep((baseDr - 4.4f) / 2.0f);
-            shadowBoost = (ultra ? 0.14f : tele ? 0.24f : 0.22f)
-                    * drGate * (1f - (ultra ? 0.90f : tele ? 0.80f : 0.65f) * noisy);
+            float baseDr = bPct[2] - bPct[0];
+            float backlightGap = bPct[2] - bPct[1];
+            float drGate = smoothStep((baseDr - 3.6f) / 2.2f);
+            float backGate = smoothStep((backlightGap - 1.6f) / 1.8f);
+            float sceneStrength = Math.max(drGate, backGate);
+            float maxLiftEv = ultra ? 0.60f : tele ? 0.86f : 0.84f;
+            shadowBoost = maxLiftEv * sceneStrength
+                    * (1f - (ultra ? 0.85f : tele ? 0.72f : 0.62f) * noisy);
         }
 
         // Stage E: OkLab filmic S-curve + perceptual chroma recovery + soft gamut clamp + Ultra HDR gainmap.
         return encodeFinalParallel(rot, opt, writer, yPlane, crPlane, cbPlane,
-                sceneStats, effSlope, baseGrid, baseW, baseH, shadowBoost);
+                sceneStats, effSlope, baseGrid, baseW, baseH, shadowBoost, noisy);
     }
 
     private void demosaicParallel(float[] yOut, float[] crOut, float[] cbOut, boolean wideGamut) {
-        int workers = width * height >= 262_144 ? 6 : 1;
+        int workers = width * height >= 262_144 ? 8 : 1;
         runStrips(height, workers, (yStart, yEnd) -> {
             ShortBuffer src = raw.duplicate();
             short[] sRow = new short[width];
@@ -629,7 +635,7 @@ final class BayerPipeline {
             prepared = bottom;
 
             // Pass 1: Horizontal joint bilateral filter (local EV luma + noise-calibrated chroma edge-stop).
-            runStrips(rows, hw * rows >= 65_536 ? 6 : 1, (r0, r1) -> {
+            runStrips(rows, hw * rows >= 65_536 ? 8 : 1, (r0, r1) -> {
                 for (int r = r0; r < r1; r++) {
                     int rowOff = r * hw;
                     for (int x = 0; x < hw; x++) {
@@ -667,7 +673,7 @@ final class BayerPipeline {
             int vStart = Math.max(0, first - 1);
             int vEnd = Math.min(hh, end + 1);
             int vCount = vEnd - vStart;
-            runStrips(vCount, hw * vCount >= 65_536 ? 6 : 1, (v0, v1) -> {
+            runStrips(vCount, hw * vCount >= 65_536 ? 8 : 1, (v0, v1) -> {
                 for (int v = v0; v < v1; v++) {
                     int hy = vStart + v;
                     int cRow = hy - top;
@@ -706,7 +712,7 @@ final class BayerPipeline {
             // Joint bilateral upsampling back to full-res luminance edges.
             final int startY = 2 * first;
             int outputRows = (end == hh ? height : 2 * end) - startY;
-            runStrips(outputRows, width * outputRows >= 262_144 ? 6 : 1, (from, to) -> {
+            runStrips(outputRows, width * outputRows >= 262_144 ? 8 : 1, (from, to) -> {
                 for (int y = startY + from; y < startY + to; y++) {
                     float fy = Math.max(0f, Math.min(hh - 1f, y * 0.5f - 0.25f));
                     int iy0 = (int) fy, iy1 = Math.min(hh - 1, iy0 + 1);
@@ -744,75 +750,74 @@ final class BayerPipeline {
     }
 
     private void denoiseAndClarityLuma(float[] yPlane, float noiseSlope, float noiseOffset) {
-        int workers = width * height >= 262_144 ? Math.min(6, Math.max(1, height / 16)) : 1;
+        int passes = noiseSlope > 4.5e-4f ? 2 : 1;
+        int workers = width * height >= 262_144 ? Math.min(8, Math.max(1, height / 16)) : 1;
         int chunk = (height + workers - 1) / workers;
-        // Snapshot exact halo rows before parallel in-place updates so threads never race at borders.
         float[][] topHalos = new float[workers][width];
         float[][] botHalos = new float[workers][width];
-        for (int w = 0; w < workers; w++) {
-            int y0 = w * chunk, y1 = Math.min(height, y0 + chunk);
-            if (y0 >= y1) break;
-            int topIdx = Math.max(0, y0 - 1);
-            int botIdx = Math.min(height - 1, y1);
-            System.arraycopy(yPlane, topIdx * width, topHalos[w], 0, width);
-            System.arraycopy(yPlane, botIdx * width, botHalos[w], 0, width);
-        }
+        for (int pass = 0; pass < passes; pass++) {
+            final float passScale = pass == 0 ? 1f : 0.72f;
+            // Snapshot exact halo rows before parallel in-place updates so threads never race at borders.
+            for (int w = 0; w < workers; w++) {
+                int y0 = w * chunk, y1 = Math.min(height, y0 + chunk);
+                if (y0 >= y1) break;
+                int topIdx = Math.max(0, y0 - 1);
+                int botIdx = Math.min(height - 1, y1);
+                System.arraycopy(yPlane, topIdx * width, topHalos[w], 0, width);
+                System.arraycopy(yPlane, botIdx * width, botHalos[w], 0, width);
+            }
 
-        List<Callable<Void>> jobs = new ArrayList<>(workers);
-        for (int w = 0; w < workers; w++) {
-            final int id = w;
-            final int y0 = w * chunk, y1 = Math.min(height, y0 + chunk);
-            if (y0 >= y1) break;
-            jobs.add(() -> {
-                float[] prev = new float[width];
-                float[] curr = new float[width];
-                float[] next = new float[width];
-                System.arraycopy(topHalos[id], 0, prev, 0, width);
-                System.arraycopy(yPlane, y0 * width, curr, 0, width);
-                for (int y = y0; y < y1; y++) {
-                    if (y + 1 < y1) {
-                        System.arraycopy(yPlane, (y + 1) * width, next, 0, width);
-                    } else {
-                        System.arraycopy(botHalos[id], 0, next, 0, width);
-                    }
-                    int rowOff = y * width;
-                    for (int x = 0; x < width; x++) {
-                        int xm = Math.max(0, x - 1), xp = Math.min(width - 1, x + 1);
-                        float c = curr[x];
-                        float s = prev[xm] + prev[x] + prev[xp]
-                                + curr[xm] + c + curr[xp]
-                                + next[xm] + next[x] + next[xp];
-                        float mean = s * (1f / 9f);
-                        float ss = prev[xm] * prev[xm] + prev[x] * prev[x] + prev[xp] * prev[xp]
-                                + curr[xm] * curr[xm] + c * c + curr[xp] * curr[xp]
-                                + next[xm] * next[xm] + next[x] * next[x] + next[xp] * next[xp];
-                        float localVar = Math.max(0f, ss * (1f / 9f) - mean * mean);
-                        float nVar = noiseSlope * Math.max(0.005f, mean) + noiseOffset;
-
-                        float out = c;
-                        if (localVar < 2.2f * nVar) {
-                            float alpha = Math.max(0f, Math.min(0.55f,
-                                    (2.2f * nVar - localVar) / Math.max(1e-7f, 2.2f * nVar)));
-                            out = c + alpha * (mean - c);
-                        } else if (localVar > 4.2f * nVar && c > 0.015f) {
-                            float relDiff = Math.abs(c - mean) / Math.max(0.05f, mean);
-                            float edgeBrake = 1f - smoothStep((relDiff - 0.25f) / 0.45f);
-                            float diff = c - mean;
-                            float maxStep = 0.045f * c;
-                            float clarity = Math.max(-maxStep, Math.min(maxStep, 0.12f * diff * edgeBrake));
-                            out = Math.max(0f, c + clarity);
+            List<Callable<Void>> jobs = new ArrayList<>(workers);
+            for (int w = 0; w < workers; w++) {
+                final int id = w;
+                final int y0 = w * chunk, y1 = Math.min(height, y0 + chunk);
+                if (y0 >= y1) break;
+                jobs.add(() -> {
+                    float[] prev = new float[width];
+                    float[] curr = new float[width];
+                    float[] next = new float[width];
+                    System.arraycopy(topHalos[id], 0, prev, 0, width);
+                    System.arraycopy(yPlane, y0 * width, curr, 0, width);
+                    for (int y = y0; y < y1; y++) {
+                        if (y + 1 < y1) {
+                            System.arraycopy(yPlane, (y + 1) * width, next, 0, width);
+                        } else {
+                            System.arraycopy(botHalos[id], 0, next, 0, width);
                         }
-                        yPlane[rowOff + x] = out;
+                        int rowOff = y * width;
+                        for (int x = 0; x < width; x++) {
+                            int xm = Math.max(0, x - 1), xp = Math.min(width - 1, x + 1);
+                            float c = curr[x];
+                            float nVar = (noiseSlope * Math.max(0.005f, c) + noiseOffset) * passScale;
+                            float invR = 1f / Math.max(1e-7f, 4.5f * nVar);
+
+                            float wSum = 1f;
+                            float valSum = c;
+
+                            float n0 = prev[x];  float d0 = n0 - c; float w0 = 0.70f / (1f + d0 * d0 * invR);
+                            float n1 = next[x];  float d1 = n1 - c; float w1 = 0.70f / (1f + d1 * d1 * invR);
+                            float n2 = curr[xm]; float d2 = n2 - c; float w2 = 0.70f / (1f + d2 * d2 * invR);
+                            float n3 = curr[xp]; float d3 = n3 - c; float w3 = 0.70f / (1f + d3 * d3 * invR);
+                            float n4 = prev[xm]; float d4 = n4 - c; float w4 = 0.45f / (1f + d4 * d4 * invR);
+                            float n5 = prev[xp]; float d5 = n5 - c; float w5 = 0.45f / (1f + d5 * d5 * invR);
+                            float n6 = next[xm]; float d6 = n6 - c; float w6 = 0.45f / (1f + d6 * d6 * invR);
+                            float n7 = next[xp]; float d7 = n7 - c; float w7 = 0.45f / (1f + d7 * d7 * invR);
+
+                            wSum += w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7;
+                            valSum += w0 * n0 + w1 * n1 + w2 * n2 + w3 * n3
+                                    + w4 * n4 + w5 * n5 + w6 * n6 + w7 * n7;
+                            yPlane[rowOff + x] = Math.max(0f, valSum / wSum);
+                        }
+                        float[] swap = prev;
+                        prev = curr;
+                        curr = next;
+                        next = swap;
                     }
-                    float[] swap = prev;
-                    prev = curr;
-                    curr = next;
-                    next = swap;
-                }
-                return null;
-            });
+                    return null;
+                });
+            }
+            invokeJobs(jobs);
         }
-        invokeJobs(jobs);
     }
 
     private static final class SceneStats {
@@ -826,36 +831,66 @@ final class BayerPipeline {
         }
     }
 
-    private SceneStats computeSceneExposure(float[] yPlane, Options opt) {
+    private SceneStats computeSceneExposure(float[] yPlane, float[] crPlane, float[] cbPlane, Options opt) {
         int step = Math.max(1, Math.min(width, height) / 96);
         int[] hist = new int[513];
-        int count = 0;
+        int[] centerHist = new int[513];
+        int[] peakHist = new int[513];
+        int count = 0, centerCount = 0;
+        int cx0 = width / 5, cx1 = width - cx0;
+        int cy0 = height / 5, cy1 = height - cy0;
+        float lumR = opt.wideGamut ? LUM_R_P3 : LUM_R_SRGB;
+        float lumG = opt.wideGamut ? LUM_G_P3 : LUM_G_SRGB;
+        float lumB = opt.wideGamut ? LUM_B_P3 : LUM_B_SRGB;
         for (int y = 0; y < height; y += step) {
             int row = y * width;
+            boolean inY = y >= cy0 && y <= cy1;
             for (int x = 0; x < width; x += step) {
-                float lum = yPlane[row + x];
-                int bin = Math.max(0, Math.min(512, Math.round(lum * 512f)));
+                int idx = row + x;
+                float lum = yPlane[idx];
+                float r = lum + crPlane[idx];
+                float b = lum + cbPlane[idx];
+                float g = (lum - lumR * r - lumB * b) / lumG;
+                float peak = Math.max(lum, Math.max(r, Math.max(g, b)));
+                int bin = Math.max(0, Math.min(512,
+                        Math.round((float) Math.sqrt(Math.max(0f, lum) * 0.25f) * 512f)));
+                int pBin = Math.max(0, Math.min(512,
+                        Math.round((float) Math.sqrt(Math.max(0f, peak) * 0.25f) * 512f)));
                 hist[bin]++;
+                peakHist[pBin]++;
                 count++;
+                if (inY && x >= cx0 && x <= cx1) {
+                    centerHist[bin]++;
+                    centerCount++;
+                }
             }
         }
         if (count == 0) return new SceneStats(1f, 0f, 0.18f, 0.5f);
-        float p005 = histPercentile(hist, count, 0.005f, 512f);
-        float p10 = histPercentile(hist, count, 0.10f, 512f);
-        float p50 = histPercentile(hist, count, 0.50f, 512f);
-        float p92 = histPercentile(hist, count, 0.92f, 512f);
-        float p995 = histPercentile(hist, count, 0.995f, 512f);
+        float p005 = sqrtHistPercentile(hist, count, 0.005f);
+        float p10 = sqrtHistPercentile(hist, count, 0.10f);
+        float p50 = sqrtHistPercentile(hist, count, 0.50f);
+        float p75 = sqrtHistPercentile(hist, count, 0.75f);
+        float p92 = sqrtHistPercentile(hist, count, 0.92f);
+        float p98Peak = sqrtHistPercentile(peakHist, count, 0.98f);
+        float p995Peak = sqrtHistPercentile(peakHist, count, 0.995f);
+        float cP50 = centerCount > 0 ? sqrtHistPercentile(centerHist, centerCount, 0.50f) : p50;
+        float cP75 = centerCount > 0 ? sqrtHistPercentile(centerHist, centerCount, 0.75f) : p75;
 
         float exposure = 1f;
         if (Math.abs(opt.userEvBias) < 0.05f && p92 - p10 > 0.035f && p92 > 0.06f) {
-            float gainKey = 0.145f / Math.max(p50, 0.020f);
+            float subjectRef = Math.max(cP50 * 1.10f, cP75 * 0.60f);
+            float subjectNeed = smoothStep((0.20f - subjectRef) / 0.11f);
+            float gainKey = 0.185f / Math.max(subjectRef, 0.024f);
             float gainWhite = 0.78f / Math.max(p92, 0.075f);
-            float gainHi = 1.95f / Math.max(p995, 0.22f);
+            float gainPeak = 1.22f / Math.max(p98Peak, 0.22f);
+            float gainHi = 2.10f / Math.max(p995Peak, 0.26f);
             float nightGate = smoothStep((p92 - 0.06f) / 0.10f);
-            float blended = 0.45f * Math.max(gainKey, 1f) + 0.55f * Math.max(gainWhite, 1f);
-            float rawGain = Math.max(1f, Math.min(Math.min(3.5f, Math.max(1.65f, gainHi)),
-                    Math.min(gainWhite, blended)));
-            exposure = 1f + nightGate * (rawGain - 1f);
+            float evGate = Float.isFinite(opt.sceneEv)
+                    ? (0.45f + 0.55f * smoothStep((opt.sceneEv - 3.5f) / 3.0f)) : 1f;
+            float blended = 0.60f * Math.max(gainKey, 1f) + 0.40f * Math.max(gainWhite, 1f);
+            float hiCap = Math.min(2.8f, Math.min(Math.max(1.20f, gainPeak), Math.max(1.55f, gainHi)));
+            float rawGain = Math.max(1f, Math.min(hiCap, Math.min(gainWhite, blended)));
+            exposure = 1f + nightGate * evGate * subjectNeed * (rawGain - 1f);
         }
 
         float blackVeil = 0f;
@@ -863,7 +898,8 @@ final class BayerPipeline {
             float maxVeil = (opt.equivalentMm >= 45f) ? 0.014f
                     : (opt.equivalentMm > 0f && opt.equivalentMm < 20f) ? 0.010f : 0.008f;
             float drWeight = smoothStep((p92 - p005 - 0.12f) / 0.28f);
-            blackVeil = Math.min(maxVeil, Math.max(0f, (p005 - 0.002f) * 0.55f)) * drWeight;
+            float glareGate = smoothStep((p75 - 0.18f) / 0.30f);
+            blackVeil = Math.min(maxVeil, Math.max(0f, (p005 - 0.002f) * 0.55f)) * drWeight * glareGate;
         }
         return new SceneStats(exposure, blackVeil, p50, p92);
     }
@@ -909,15 +945,16 @@ final class BayerPipeline {
             hist[bin]++;
         }
         float lo = histPercentile(hist, base.length, 0.05f, 256f / 12f) - 9f;
+        float mid = histPercentile(hist, base.length, 0.50f, 256f / 12f) - 9f;
         float hi = histPercentile(hist, base.length, 0.98f, 256f / 12f) - 9f;
-        return new float[]{lo, hi};
+        return new float[]{lo, mid, hi};
     }
 
     private GainmapData encodeFinalParallel(int rotation, Options opt, StripWriter writer,
                                             float[] yPlane, float[] crPlane, float[] cbPlane,
                                             SceneStats sceneStats, float effSlope,
                                             float[] baseGrid, int baseW, int baseH,
-                                            float shadowBoost) {
+                                            float shadowBoost, float noisy) {
         boolean swap = rotation % 180 != 0;
         int outW = swap ? height : width;
         int outH = swap ? width : height;
@@ -927,6 +964,10 @@ final class BayerPipeline {
         final float invLogMaxRatio = 1f / log2f(maxGainRatio);
         byte[] gainPixels = opt.buildGainmap ? new byte[gw * gh] : null;
         PhotoFilter filter = opt.filter;
+        final boolean isMaster = filter == PhotoFilter.MASTER;
+        final float clarityGain = isMaster ? 0.22f
+                : filter == PhotoFilter.DETAIL ? 0.24f
+                : filter == PhotoFilter.SOFT ? 0.08f : 0.15f;
 
         final boolean wideGamut = opt.wideGamut;
         final float lumR = wideGamut ? LUM_R_P3 : LUM_R_SRGB;
@@ -945,7 +986,7 @@ final class BayerPipeline {
 
         int stripRows = Math.min(height, STRIP_HEIGHT);
         int stripCount = (height + stripRows - 1) / stripRows;
-        int workers = width * height >= 262_144 ? Math.min(6, stripCount) : 1;
+        int workers = width * height >= 262_144 ? Math.min(8, stripCount) : 1;
 
         runStrips(stripCount, workers, (s0, s1) -> {
             int[] pixels = new int[width * stripRows];
@@ -986,24 +1027,35 @@ final class BayerPipeline {
                         if (baseGrid != null && lum > 1e-5f) {
                             float fx = Math.max(0f, Math.min(baseW - 1f, x * 0.25f - 0.375f));
                             int ix0 = (int) fx, ix1 = Math.min(baseW - 1, ix0 + 1);
-                            float base = bilerp(baseGrid, bRow0, bRow1, ix0, ix1, fx - ix0, ty);
                             float logLum = log2f(lum + 0.003f);
+                            float g00 = baseGrid[bRow0 + ix0], g01 = baseGrid[bRow0 + ix1];
+                            float g10 = baseGrid[bRow1 + ix0], g11 = baseGrid[bRow1 + ix1];
+                            float tx = fx - ix0, ux = 1f - tx, uy = 1f - ty;
+                            float d00 = g00 - logLum, d01 = g01 - logLum;
+                            float d10 = g10 - logLum, d11 = g11 - logLum;
+                            float w00 = (ux * uy) / (1f + 2.5f * d00 * d00);
+                            float w01 = (tx * uy) / (1f + 2.5f * d01 * d01);
+                            float w10 = (ux * ty) / (1f + 2.5f * d10 * d10);
+                            float w11 = (tx * ty) / (1f + 2.5f * d11 * d11);
+                            float base = (w00 * g00 + w01 * g01 + w10 * g10 + w11 * g11)
+                                    / (w00 + w01 + w10 + w11);
                             float detail = logLum - base;
 
                             float newBase = base;
-                            if (base > 0.05f) {
-                                newBase -= 0.22f * (base - 0.05f);
+                            if (base > -0.15f) {
+                                newBase -= 0.30f * (base + 0.15f);
                             }
-                            if (shadowBoost > 0f && base > -5.6f && base < -2.2f) {
-                                float midBell = smoothStep((base + 5.6f) / 1.4f)
-                                        * (1f - smoothStep((base + 3.2f) / 1.0f));
-                                newBase += shadowBoost * 0.65f * midBell;
+                            if (shadowBoost > 0f && base > -6.0f && base < -2.2f) {
+                                float shadowRise = smoothStep((base + 6.0f) / 1.5f);
+                                float midFall = 1f - smoothStep((base + 3.6f) / 1.4f);
+                                newBase += shadowBoost * shadowRise * midFall;
                             }
-                            float noiseGate = smoothStep((lum - 0.015f) / 0.045f);
-                            float detailBrake = 1f - smoothStep((Math.abs(detail) - 0.25f) / 0.40f);
-                            float newLog = newBase + detail * (1f + 0.08f * noiseGate * detailBrake);
+                            float noiseGate = smoothStep((lum - 0.014f) / 0.042f) * (1f - 0.55f * noisy);
+                            float hiGate = 1f - smoothStep((lum - 0.72f) / 0.38f);
+                            float detailBrake = 1f - smoothStep((Math.abs(detail) - 0.12f) / 0.22f);
+                            float newLog = newBase + detail * (1f + clarityGain * noiseGate * hiGate * detailBrake);
                             float targetY = Math.max(0f, exp2f(newLog) - 0.003f);
-                            float ratio = Math.max(0.50f, Math.min(1.65f, targetY / lum));
+                            float ratio = Math.max(0.45f, Math.min(2.35f, targetY / lum));
                             lum *= ratio;
                             cr *= ratio;
                             cb *= ratio;
@@ -1026,52 +1078,110 @@ final class BayerPipeline {
                         }
 
                         float peakHdr = Math.max(r, Math.max(g, b));
-                        if (Math.max(Math.abs(r - g), Math.abs(g - b)) < 1e-6f) {
+                        if (Math.max(Math.abs(r - g), Math.abs(g - b)) < 1e-5f) {
                             float mapped = Math.max(0f, Math.min(1f, opticalFilmic(lum)));
                             r = g = b = mapped;
                         } else {
                             float lumMapped = opticalFilmic(lum);
                             float tmScale = lum > 1e-6f ? lumMapped / lum : 0f;
                             rgbToOklab(r * tmScale, g * tmScale, b * tmScale, toLms, labL);
-                            rgbToOklab(opticalFilmic(r), opticalFilmic(g), opticalFilmic(b), toLms, labC);
 
                             float lTarget = Math.max(0f, Math.min(0.9999f, labL[0]));
                             float aL = labL[1], bL_ok = labL[2];
-                            float cL = (float) Math.hypot(aL, bL_ok);
-                            float cC = (float) Math.hypot(labC[1], labC[2]);
+                            float cL = (float) Math.sqrt(aL * aL + bL_ok * bL_ok);
 
-                            // Narrow skin-tone protection in OkLab (hue ~25-65 deg, moderate chroma).
+                            // Tightened human skin-tone protection in OkLab (mid-light warm hues, low-to-moderate chroma).
                             float skin = 0f;
-                            if (aL > 0f && bL_ok > 0f && cL > 0.025f) {
+                            if (aL > 0f && bL_ok > 0f && cL > 0.022f && lTarget > 0.38f) {
                                 float tanH = bL_ok / (aL + 1e-6f);
-                                skin = smoothStep((tanH - 0.40f) / 0.25f)
-                                        * (1f - smoothStep((tanH - 1.55f) / 0.65f))
-                                        * smoothStep((cL - 0.025f) / 0.025f)
-                                        * (1f - smoothStep((cL - 0.12f) / 0.06f));
+                                skin = smoothStep((tanH - 0.50f) / 0.25f)
+                                        * (1f - smoothStep((tanH - 1.55f) / 0.55f))
+                                        * smoothStep((lTarget - 0.38f) / 0.14f)
+                                        * (1f - smoothStep((lTarget - 0.84f) / 0.10f))
+                                        * smoothStep((cL - 0.022f) / 0.020f)
+                                        * (1f - smoothStep((cL - 0.095f) / 0.045f));
                             }
 
-                            float beta = 0.60f * (1f - 0.35f * skin);
-                            float cTarget = cL + beta * (cC - cL);
+                            float hiBlend = smoothStep((peakHdr - 0.28f) / 0.22f);
+                            float cTarget = cL;
+                            float aBase = aL, bBase = bL_ok;
+                            if (hiBlend > 0f) {
+                                rgbToOklab(opticalFilmic(r), opticalFilmic(g), opticalFilmic(b), toLms, labC);
+                                float peakExcess = smoothStep((peakHdr - 0.40f) / 0.45f);
+                                if (labC[0] < lTarget && peakExcess > 0f) {
+                                    lTarget += (labC[0] - lTarget) * (0.95f * peakExcess);
+                                }
+                                float cC = (float) Math.sqrt(labC[1] * labC[1] + labC[2] * labC[2]);
+                                float beta = Math.min(0.97f, 0.72f + 0.25f * peakExcess) * hiBlend * (1f - 0.20f * skin);
+                                cTarget = cL + beta * (cC - cL);
+                                float hueRoll = 0.40f * smoothStep((peakHdr - 0.55f) / 0.45f) * (1f - 0.50f * skin);
+                                if (hueRoll > 0f && cC > 1e-5f && cL > 1e-5f) {
+                                    float sc = cL / cC;
+                                    aBase = aL + hueRoll * (labC[1] * sc - aL);
+                                    bBase = bL_ok + hueRoll * (labC[2] * sc - bL_ok);
+                                }
+                            }
 
-                            float lGate = smoothStep((lTarget - 0.10f) / 0.14f)
-                                    * (1f - smoothStep((lTarget - 0.72f) / 0.20f));
-                            float cGate = smoothStep((cL - 0.012f) / 0.030f)
-                                    * (1f - smoothStep((cL - 0.16f) / 0.12f));
-                            float boost = (0.12f + 0.06f * dimBoost + teleBoost)
-                                    * lGate * cGate * (1f - 0.35f * skin);
-                            cTarget = Math.max(0f, cTarget * (1f + boost));
+                            float aRot = aBase, bRot = bBase;
+                            if (cL > 0.012f) {
+                                float invC = 1f / cL;
+                                float cosH = aBase * invC;
+                                float sinH = bBase * invC;
+                                float redW = smoothStep((cosH * 0.94f + sinH * 0.34f - 0.65f) / 0.30f);
+                                float goldW = smoothStep((cosH * 0.53f + sinH * 0.85f - 0.65f) / 0.30f) * (1f - skin);
+                                float greenW = smoothStep((cosH * -0.50f + sinH * 0.866f - 0.60f) / 0.35f);
+                                float blueW = smoothStep((cosH * -0.37f + sinH * -0.93f - 0.65f) / 0.30f);
 
-                            float scaleC = cL > 1e-6f ? cTarget / cL : 0f;
-                            float aT = aL * scaleC;
-                            float bT = bL_ok * scaleC;
+                                float lGate = smoothStep((lTarget - 0.12f) / 0.14f)
+                                        * (1f - smoothStep((lTarget - 0.68f) / 0.20f));
+                                float cGate = smoothStep((cL - 0.012f) / 0.028f)
+                                        * (1f - smoothStep((cL - 0.17f) / 0.12f));
+                                float peakBrake = 1f - smoothStep((peakHdr - 0.68f) / 0.35f);
+                                float hueBoost = (isMaster ? 0.09f : 0.05f) * redW
+                                        + (isMaster ? 0.10f : 0.06f) * goldW
+                                        + (isMaster ? 0.07f : 0.04f) * greenW
+                                        + (isMaster ? 0.07f : 0.03f) * blueW;
+                                float boost = (0.14f + 0.07f * dimBoost + teleBoost + hueBoost)
+                                        * lGate * cGate * peakBrake * (1f - 0.50f * skin);
+                                cTarget = Math.max(0f, cTarget * (1f + boost));
+
+                                float midC = smoothStep((cL - 0.025f) / 0.045f)
+                                        * smoothStep((lTarget - 0.16f) / 0.12f)
+                                        * (1f - smoothStep((lTarget - 0.75f) / 0.18f));
+                                if (midC > 0f) {
+                                    float lDelta = (isMaster ? 0.022f : 0.014f) * goldW * (1f - smoothStep((lTarget - 0.45f) / 0.20f))
+                                            + (isMaster ? 0.016f : 0.010f) * greenW * (1f - smoothStep((lTarget - 0.48f) / 0.20f))
+                                            - (isMaster ? 0.028f : 0.014f) * blueW
+                                            - (isMaster ? 0.014f : 0.008f) * redW * smoothStep((cL - 0.08f) / 0.06f);
+                                    lTarget = Math.max(0.001f, Math.min(0.9999f, lTarget + lDelta * midC));
+
+                                    if (greenW > 0f) {
+                                        float rad = (isMaster ? 0.085f : 0.050f) * greenW * midC;
+                                        float cs = 1f - 0.5f * rad * rad;
+                                        aRot = aBase * cs - bBase * rad;
+                                        bRot = aBase * rad + bBase * cs;
+                                    }
+                                }
+                            }
+
+                            float baseMag = (float) Math.sqrt(aBase * aBase + bBase * bBase);
+                            float scaleC = baseMag > 1e-6f ? cTarget / baseMag : 0f;
+                            float aT = aRot * scaleC;
+                            float bT = bRot * scaleC;
 
                             oklabToRgb(lTarget, aT, bT, fromLms, rgbOut);
                             if (rgbOut[0] < 0f || rgbOut[1] < 0f || rgbOut[2] < 0f
                                     || rgbOut[0] > 1f || rgbOut[1] > 1f || rgbOut[2] > 1f) {
+                                float maxOut = Math.max(rgbOut[0], Math.max(rgbOut[1], rgbOut[2]));
+                                float cW = smoothStep((cTarget - 0.05f) / 0.10f);
+                                float lAnchor = (maxOut > 1f && lTarget > 0.60f)
+                                        ? (lTarget - 0.58f * (lTarget - 0.60f) * cW)
+                                        : lTarget;
                                 float lo = 0f, hi = 1f;
                                 for (int it = 0; it < 5; it++) {
                                     float mid = 0.5f * (lo + hi);
-                                    oklabToRgb(lTarget, aT * mid, bT * mid, fromLms, rgbOut);
+                                    float lTry = lAnchor + (lTarget - lAnchor) * mid;
+                                    oklabToRgb(lTry, aT * mid, bT * mid, fromLms, rgbOut);
                                     if (rgbOut[0] >= 0f && rgbOut[1] >= 0f && rgbOut[2] >= 0f
                                             && rgbOut[0] <= 1f && rgbOut[1] <= 1f && rgbOut[2] <= 1f) {
                                         lo = mid;
@@ -1079,7 +1189,7 @@ final class BayerPipeline {
                                         hi = mid;
                                     }
                                 }
-                                oklabToRgb(lTarget, aT * lo, bT * lo, fromLms, rgbOut);
+                                oklabToRgb(lAnchor + (lTarget - lAnchor) * lo, aT * lo, bT * lo, fromLms, rgbOut);
                             }
                             r = Math.max(0f, Math.min(1f, rgbOut[0]));
                             g = Math.max(0f, Math.min(1f, rgbOut[1]));
@@ -1157,7 +1267,7 @@ final class BayerPipeline {
 
     private static void boxFilter(float[] src, int w, int h, int r, float[] tmp, float[] dst) {
         float inv = 1f / (2 * r + 1);
-        runStrips(h, w * h >= 65_536 ? 6 : 1, (y0, y1) -> {
+        runStrips(h, w * h >= 65_536 ? 8 : 1, (y0, y1) -> {
             for (int y = y0; y < y1; y++) {
                 int row = y * w;
                 float sum = src[row] * (r + 1);
@@ -1170,7 +1280,7 @@ final class BayerPipeline {
                 }
             }
         });
-        runStrips(w, w * h >= 65_536 ? 6 : 1, (x0, x1) -> {
+        runStrips(w, w * h >= 65_536 ? 8 : 1, (x0, x1) -> {
             for (int x = x0; x < x1; x++) {
                 float sum = tmp[x] * (r + 1);
                 for (int dy = 1; dy <= r; dy++) sum += tmp[Math.min(h - 1, dy) * w + x];
@@ -1184,12 +1294,6 @@ final class BayerPipeline {
         });
     }
 
-    private static float bilerp(float[] grid, int r0, int r1, int ix0, int ix1, float tx, float ty) {
-        float topVal = grid[r0 + ix0] + tx * (grid[r0 + ix1] - grid[r0 + ix0]);
-        float botVal = grid[r1 + ix0] + tx * (grid[r1 + ix1] - grid[r1 + ix0]);
-        return topVal + ty * (botVal - topVal);
-    }
-
     private static float histPercentile(int[] hist, int count, float fraction, float scale) {
         int target = Math.round(count * fraction);
         int i = 0, sum = hist[0];
@@ -1197,12 +1301,27 @@ final class BayerPipeline {
         return i / scale;
     }
 
-    private static float log2f(float v) {
-        return (float) (Math.log(v) * 1.4426950408889634);
+    private static float sqrtHistPercentile(int[] hist, int count, float fraction) {
+        float norm = histPercentile(hist, count, fraction, 512f);
+        return norm * norm * 4f;
     }
 
-    private static float exp2f(float v) {
-        return (float) Math.pow(2.0, v);
+    static float log2f(float x) {
+        if (x <= 0f) return -126f;
+        int bits = Float.floatToRawIntBits(x);
+        int exp = ((bits >>> 23) & 0xff) - 127;
+        float m = Float.intBitsToFloat((bits & 0x007fffff) | 0x3f800000);
+        float t = (m - 1f) / (m + 1f);
+        float t2 = t * t;
+        return exp + 2.88539008f * t * (1f + t2 * (0.33333334f + t2 * 0.2f));
+    }
+
+    static float exp2f(float x) {
+        float clamped = Math.max(-126f, Math.min(126f, x));
+        int fl = (int) Math.floor(clamped);
+        float f = clamped - fl;
+        float p = 1f + f * (0.69303212f + f * (0.24137976f + f * (0.05203236f + f * 0.01355575f)));
+        return Float.intBitsToFloat((fl + 127) << 23) * p;
     }
 
     interface StripTask { void run(int start, int end); }
@@ -1345,7 +1464,7 @@ final class BayerPipeline {
 
     private static float[] buildOpticalFilmic() {
         float[] x = {0f, .005f, .015f, .04f, .09f, .18f, .35f, .55f, .85f, 1f, 1.5f, 2.5f, 4f, 8f};
-        float[] y = {0f, .0018f, .0080f, .029f, .084f, .205f, .430f, .635f, .832f, .885f, .946f, .979f, .992f, .998f};
+        float[] y = {0f, .0027f, .0115f, .0355f, .095f, .215f, .428f, .625f, .828f, .880f, .943f, .977f, .991f, .998f};
         float[] slope = new float[x.length];
         float previous = slope[0] = y[1] / x[1];
         for (int i = 1; i < x.length - 1; i++) {
